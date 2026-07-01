@@ -732,3 +732,223 @@ def pd_to_iso_date(v):
         return v.strftime("%Y-%m-%d")
     import pandas as pd
     return pd.to_datetime(v).strftime("%Y-%m-%d")
+
+# ================================================================
+# MÓDULO: Busca automática de balanço/DRE via yfinance
+# e cálculo completo de valor intrínseco com CDI e Selic
+# ================================================================
+
+def buscar_balanco_yfinance(ticker_b3: str) -> dict:
+    """Busca balanço/DRE do Yahoo Finance via yfinance.
+    ticker_b3: código B3 sem .SA (ex: 'TRIS3') — função adiciona .SA automaticamente.
+    Retorna dict com os campos de balancos_dre ou lança exceção."""
+    import yfinance as yf
+
+    ticker_yahoo = ticker_b3.upper() + ".SA"
+    ativo = yf.Ticker(ticker_yahoo)
+
+    info = ativo.info or {}
+    bs = ativo.balance_sheet
+    is_ = ativo.income_stmt
+    cf = ativo.cashflow
+
+    def get_bs(chaves):
+        for c in chaves:
+            for col in (bs.columns if bs is not None and not bs.empty else []):
+                row = bs.loc[bs.index == c]
+                if not row.empty:
+                    v = row.iloc[0, 0]
+                    if v is not None and str(v) not in ("nan","None"):
+                        return float(v) / 1000  # converte para milhares
+        return None
+
+    def get_is(chaves):
+        for c in chaves:
+            for col in (is_.columns if is_ is not None and not is_.empty else []):
+                row = is_.loc[is_.index == c]
+                if not row.empty:
+                    v = row.iloc[0, 0]
+                    if v is not None and str(v) not in ("nan","None"):
+                        return float(v) / 1000
+        return None
+
+    def get_cf(chaves):
+        for c in chaves:
+            if cf is not None and not cf.empty:
+                row = cf.loc[cf.index == c] if c in cf.index else None
+                if row is not None and not row.empty:
+                    v = row.iloc[0, 0]
+                    if v is not None and str(v) not in ("nan","None"):
+                        return float(v) / 1000
+        return None
+
+    # data de referência = último balanço disponível
+    data_ref = None
+    if bs is not None and not bs.empty:
+        data_ref = str(bs.columns[0].date()) if hasattr(bs.columns[0], 'date') else str(bs.columns[0])[:10]
+
+    total_assets    = get_bs(["Total Assets"])
+    total_liab      = get_bs(["Total Liabilities Net Minority Interest","Total Liabilities"])
+    total_equity    = get_bs(["Common Stock Equity","Stockholders Equity"])
+    net_tangible    = get_bs(["Net Tangible Assets"])
+    working_capital = get_bs(["Working Capital"])
+    total_debt      = get_bs(["Total Debt"])
+    net_debt        = get_bs(["Net Debt"])
+    share_issued    = info.get("sharesOutstanding")
+    if share_issued:
+        share_issued = share_issued / 1000  # para milhares
+
+    total_revenue   = get_is(["Total Revenue"])
+    cost_rev        = get_is(["Cost Of Revenue","Cost of Revenue"])
+    gross_profit    = get_is(["Gross Profit"])
+    op_income       = get_is(["Operating Income"])
+    net_income      = get_is(["Net Income Common Stockholders","Net Income"])
+    interest_exp    = get_is(["Interest Expense"])
+    ebit            = get_is(["EBIT"])
+    ebitda          = get_is(["EBITDA"])
+
+    dep_amort       = get_cf(["Depreciation And Amortization","Depreciation"])
+    capex           = get_cf(["Capital Expenditure","Capital Expenditures"])
+    if capex and capex < 0:
+        capex = abs(capex)
+
+    preco_atual = info.get("currentPrice") or info.get("regularMarketPrice")
+
+    return {
+        "data_referencia": data_ref,
+        "total_assets": total_assets,
+        "total_liabilities": total_liab,
+        "total_equity": total_equity,
+        "net_tangible_assets": net_tangible,
+        "working_capital": working_capital,
+        "total_debt": total_debt,
+        "net_debt": net_debt,
+        "share_issued": share_issued,
+        "total_revenue": total_revenue,
+        "cost_of_revenue": cost_rev,
+        "gross_profit": gross_profit,
+        "operating_income": op_income,
+        "net_income": net_income,
+        "interest_expense": interest_exp,
+        "ebit": ebit,
+        "ebitda": ebitda,
+        "depreciacao_amortizacao": dep_amort,
+        "capex": capex,
+        "preco_mercado_referencia": preco_atual,
+        "fonte_balanco": f"Yahoo Finance / yfinance ({ticker_yahoo})",
+        "fonte_dre": f"Yahoo Finance / yfinance ({ticker_yahoo})",
+        "fonte_preco": "Yahoo Finance / yfinance (cotação atual)",
+    }
+
+
+def calcular_g_cagr(lucros_historicos: list) -> float:
+    """Calcula CAGR (taxa de crescimento anual composta) do lucro.
+    lucros_historicos: lista de lucros em ordem cronológica [mais_antigo, ..., mais_recente].
+    Retorna g em % (ex.: 9.2 para 9,2%)."""
+    lucros = [l for l in lucros_historicos if l and l > 0]
+    if len(lucros) < 2:
+        return 0.0
+    n = len(lucros) - 1
+    return ((lucros[-1] / lucros[0]) ** (1 / n) - 1) * 100
+
+
+def calcular_valor_intrinseco_completo(bal: dict, g_pct: float,
+                                        cdi_pct: float, selic_pct: float,
+                                        anos_fcd: int = 5,
+                                        g_terminal_pct: float = 3.0) -> dict:
+    """Calcula todos os métodos de valor intrínseco usando:
+    - g_pct: taxa de crescimento em % (ex.: 9.2)
+    - cdi_pct: CDI atual em % (usado como Y no Graham complexo)
+    - selic_pct: Selic atual em % (WACC = Selic + 4%)
+    Retorna dict com todos os valores e premissas."""
+    lpa = None
+    vpa = None
+    share = bal.get("share_issued")
+    net_income = bal.get("net_income")
+    equity = bal.get("total_equity")
+    ebit = bal.get("ebit")
+    dep = bal.get("depreciacao_amortizacao") or 0
+    capex = bal.get("capex") or 0
+    net_debt = bal.get("net_debt") or 0
+    preco = bal.get("preco_mercado_referencia")
+
+    if net_income and share and share > 0:
+        lpa = net_income / share
+    if equity and share and share > 0:
+        vpa = equity / share
+
+    # FCF
+    taxa_ir = 0.25
+    delta_cap_giro = bal.get("delta_capital_giro", 0) or 0
+    fcf = None
+    if ebit:
+        fcf = ebit * (1 - taxa_ir) + dep - capex - delta_cap_giro
+
+    # Graham Simplificado
+    vi_simpl = graham_simplificado(lpa, g=g_pct) if lpa else None
+
+    # Número de Graham
+    vi_numero = graham_numero(lpa, vpa) if (lpa and vpa) else None
+
+    # Graham Complexo — Y = CDI atual
+    y = cdi_pct
+    vi_complexo = graham_complexo(lpa, g_pct, y) if (lpa and y) else None
+
+    # FCD — WACC = Selic + 4%
+    wacc = (selic_pct + 4.0) / 100
+    g_fcd = g_pct / 100
+    g_terminal = g_terminal_pct / 100
+    vi_fcd, detalhe_fcd = fluxo_caixa_descontado(
+        fcf, g_fcd, wacc, anos=anos_fcd,
+        g_terminal=g_terminal,
+        divida_liquida=net_debt,
+        num_acoes=share
+    ) if (fcf and share and share > 0) else (None, {})
+
+    # Margem de segurança (média dos métodos calculados)
+    vis = [v for v in [vi_simpl, vi_numero, vi_complexo, vi_fcd] if v]
+    vi_medio = sum(vis) / len(vis) if vis else None
+    margem = margem_seguranca(vi_medio, preco) if (vi_medio and preco) else None
+    classificacao = classificar(margem) if margem is not None else "Sem dados"
+
+    return {
+        "lpa": lpa,
+        "vpa": vpa,
+        "fcf": fcf,
+        "g_pct": g_pct,
+        "cdi_pct": cdi_pct,
+        "selic_pct": selic_pct,
+        "wacc_pct": selic_pct + 4.0,
+        "vi_simplificado": vi_simpl,
+        "vi_numero_graham": vi_numero,
+        "vi_complexo": vi_complexo,
+        "vi_fcd": vi_fcd,
+        "vi_medio": vi_medio,
+        "preco_mercado": preco,
+        "margem_seguranca_pct": margem,
+        "classificacao": classificacao,
+        "detalhe_fcd": detalhe_fcd,
+        "premissas": {
+            "g_%": g_pct, "CDI_%": cdi_pct,
+            "Selic_%": selic_pct, "WACC_%": selic_pct + 4.0,
+            "g_terminal_%": g_terminal_pct, "anos_fcd": anos_fcd,
+            "taxa_IR": taxa_ir
+        }
+    }
+
+
+def buscar_cdi_selic_atual(conn_ou_sb) -> tuple:
+    """Busca CDI e Selic mais recentes do banco de índices macroeconômicos.
+    Retorna (cdi_pct, selic_pct). Se não encontrar, retorna defaults conservadores."""
+    try:
+        # Supabase
+        cdi_rows = conn_ou_sb.table("indices_macroeconomicos").select("no_mes,valor").eq("indice","CDI").order("data_referencia", desc=True).limit(1).execute().data
+        sel_rows = conn_ou_sb.table("indices_macroeconomicos").select("no_mes,valor").eq("indice","Selic").order("data_referencia", desc=True).limit(1).execute().data
+        cdi = float(cdi_rows[0].get("no_mes") or cdi_rows[0].get("valor") or 1.16) if cdi_rows else 1.16
+        sel = float(sel_rows[0].get("no_mes") or sel_rows[0].get("valor") or 1.22) if sel_rows else 1.22
+        # converte de taxa mensal para anual: (1+m)^12 - 1
+        cdi_anual = ((1 + cdi/100) ** 12 - 1) * 100
+        sel_anual = ((1 + sel/100) ** 12 - 1) * 100
+        return round(cdi_anual, 2), round(sel_anual, 2)
+    except Exception:
+        return 15.0, 15.25  # defaults conservadores se banco não tiver dados
