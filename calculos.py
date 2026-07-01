@@ -582,66 +582,145 @@ def atualizar_indicadores_carteira(conn, carteira_id, g=6.0, y=6.5, wacc=10.0):
 
 # ---------- Importação de série histórica de índices macroeconômicos via Excel ----------
 
-def importar_indices_excel(conn, df, arquivo_origem="upload"):
-    """df deve ter colunas: Índice (ou Indice/indicador), Data, Valor, Fonte (opcional).
-    Aceita uma planilha com várias linhas (datas) por índice, ex. série histórica completa
-    de Selic, CDI, IPCA, IGP-M, Ibovespa. Retorna (qtd_importadas, avisos)."""
+def importar_indices_excel(conn, df, arquivo_origem="upload", indicador_nome=None):
+    """Aceita dois formatos:
+    FORMATO PADRONIZADO (novo — template): colunas Ano, Mês, No mês, Em 3 meses,
+      Em 6 meses, No Ano, Em 12 meses. O nome do índice vem do parâmetro
+      indicador_nome OU da célula A1 da planilha (lida antes de passar o df).
+    FORMATO ANTIGO: colunas Índice, Data, Valor, Fonte.
+    Retorna (qtd_importadas, avisos)."""
     import unicodedata
+    import calendar
 
-    def normaliza(col):
+    def norm(col):
         col = str(col).strip().lower()
         col = "".join(c for c in unicodedata.normalize("NFKD", col) if not unicodedata.combining(c))
-        col = col.replace(" ", "_")
-        return col
+        return col.replace(" ", "_")
 
     df = df.copy()
-    df.columns = [normaliza(c) for c in df.columns]
+    df.columns = [norm(c) for c in df.columns]
+    cols = list(df.columns)
+    avisos = []
 
+    # Detectar formato padronizado: tem coluna 'ano' e 'mes'
+    if "ano" in cols and "mes" in cols:
+        # Formato padronizado (Ano, Mês, No mês, Em 3 meses, Em 6 meses, No Ano, Em 12 meses)
+        if not indicador_nome:
+            avisos.append("Nome do índice não informado. Use o campo 'Índice' ao importar.")
+            return 0, avisos
+
+        col_no_mes = next((c for c in cols if "no_mes" in c or c == "no_mes"), None)
+        col_3m = next((c for c in cols if "3" in c), None)
+        col_6m = next((c for c in cols if "6" in c), None)
+        col_no_ano = next((c for c in cols if "no_ano" in c or c == "no_ano"), None)
+        col_12m = next((c for c in cols if "12" in c), None)
+
+        if not col_no_mes:
+            avisos.append(f"Coluna 'No mês' não encontrada. Colunas recebidas: {cols}")
+            return 0, avisos
+
+        importadas = 0
+        for _, row in df.iterrows():
+            ano = row.get("ano")
+            mes = row.get("mes")
+            if not ano or not mes:
+                continue
+            try:
+                ano, mes = int(ano), int(mes)
+            except (ValueError, TypeError):
+                continue
+            # último dia do mês como data de referência
+            ultimo_dia = calendar.monthrange(ano, mes)[1]
+            data_str = f"{ano:04d}-{mes:02d}-{ultimo_dia:02d}"
+
+            no_mes = row.get(col_no_mes)
+            if no_mes is None or str(no_mes).strip() in ("", "nan", "None"):
+                continue
+
+            def safe(col):
+                if col is None: return None
+                v = row.get(col)
+                if v is None or str(v).strip() in ("", "nan", "None"): return None
+                try: return float(v)
+                except: return None
+
+            registro = {
+                "indice": indicador_nome,
+                "data_referencia": data_str,
+                "valor": float(no_mes),   # 'valor' = no_mes para compatibilidade
+                "no_mes": float(no_mes),
+                "em_3_meses": safe(col_3m),
+                "em_6_meses": safe(col_6m),
+                "no_ano": safe(col_no_ano),
+                "em_12_meses": safe(col_12m),
+                "fonte": arquivo_origem,
+            }
+            # remove chaves com valor None para não sobrescrever com null
+            registro_limpo = {k: v for k, v in registro.items() if v is not None or k in ("indice","data_referencia","valor","no_mes","fonte")}
+
+            if conn is None:
+                # modo Supabase — retorna a lista para o app.py fazer o upsert
+                if not hasattr(importar_indices_excel, "_buffer"):
+                    importar_indices_excel._buffer = []
+                importar_indices_excel._buffer.append(registro_limpo)
+            else:
+                # modo SQLite (protótipo local)
+                cols_insert = ", ".join(registro_limpo.keys())
+                placeholders = ", ".join("?" * len(registro_limpo))
+                conn.execute(f"INSERT OR REPLACE INTO indices_macroeconomicos ({cols_insert}) VALUES ({placeholders})",
+                             list(registro_limpo.values()))
+            importadas += 1
+
+        if conn is not None:
+            conn.commit()
+        return importadas, avisos
+
+    # FORMATO ANTIGO: Índice, Data, Valor, Fonte
     mapa = {
         "indice": ["indice", "indicador", "nome_indice"],
-        "data": ["data", "data_referencia", "mes", "data_mes"],
-        "valor": ["valor", "valor_indice", "taxa"],
-        "fonte": ["fonte", "origem"],
+        "data":   ["data", "data_referencia", "mes", "data_mes"],
+        "valor":  ["valor", "valor_indice", "taxa"],
+        "fonte":  ["fonte", "origem"],
     }
-
     def achar(campo):
         for nome in mapa[campo]:
-            if nome in df.columns:
-                return nome
+            if nome in cols: return nome
         return None
 
-    col_indice = achar("indice")
+    col_idx = achar("indice")
     col_data = achar("data")
-    col_valor = achar("valor")
+    col_val = achar("valor")
     col_fonte = achar("fonte")
 
-    avisos = []
-    if not col_indice or not col_data or not col_valor:
-        avisos.append(f"Colunas não encontradas. Esperado algo como 'Índice', 'Data', 'Valor' (e "
-                       f"opcionalmente 'Fonte'). Colunas recebidas: {list(df.columns)}")
+    if not col_idx or not col_data or not col_val:
+        avisos.append(f"Colunas não encontradas. Use o template padronizado ou o formato 'Índice, Data, Valor'. "
+                      f"Colunas recebidas: {cols}")
         return 0, avisos
 
     importadas = 0
-    cur = conn.cursor()
     for _, row in df.iterrows():
-        indice = str(row[col_indice]).strip()
+        indice = str(row[col_idx]).strip()
         if not indice or indice.lower() == "nan":
             continue
-        data_val = row[col_data]
-        # aceita tanto data já em texto AAAA-MM-DD quanto datetime do Excel
         try:
-            data_str = pd_to_iso_date(data_val)
+            data_str = pd_to_iso_date(row[col_data])
         except Exception:
-            avisos.append(f"Data inválida na linha do índice '{indice}': {data_val!r} — linha ignorada.")
+            avisos.append(f"Data inválida: {row[col_data]!r} — linha ignorada.")
             continue
-        valor = row[col_valor]
+        valor = row[col_val]
         fonte = str(row[col_fonte]).strip() if col_fonte and pd_notna(row[col_fonte]) else arquivo_origem
-
-        cur.execute("""INSERT OR REPLACE INTO indices_macroeconomicos (indice, data_referencia, valor, fonte)
-                        VALUES (?,?,?,?)""", (indice, data_str, float(valor), fonte))
+        if conn is None:
+            if not hasattr(importar_indices_excel, "_buffer"):
+                importar_indices_excel._buffer = []
+            importar_indices_excel._buffer.append({"indice": indice, "data_referencia": data_str,
+                                                     "valor": float(valor), "no_mes": float(valor), "fonte": fonte})
+        else:
+            conn.execute("INSERT OR REPLACE INTO indices_macroeconomicos (indice, data_referencia, valor, no_mes, fonte) VALUES (?,?,?,?,?)",
+                         (indice, data_str, float(valor), float(valor), fonte))
         importadas += 1
 
-    conn.commit()
+    if conn is not None:
+        conn.commit()
     return importadas, avisos
 
 
