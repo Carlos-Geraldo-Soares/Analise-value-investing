@@ -326,10 +326,30 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
             st.markdown("---")
 
             if step == 1:
-                st.write("**Etapa 1 — Lance ou confirme o balanço mais recente.**")
+                st.write("**Etapa 1 — Balanço / DRE**")
                 bals = sb_select("balancos_dre","data_referencia", filtros={"empresa_id": emp_id}, ordem="data_referencia")
                 if bals:
-                    st.success(f"Balanço existente: {', '.join([b['data_referencia'] for b in bals])}. Pode seguir ou lançar um novo.")
+                    st.success(f"✅ Balanço já existe: {', '.join([b['data_referencia'] for b in bals])}. Pode avançar ou buscar dados mais recentes.")
+
+                st.subheader("🌐 Buscar balanço automaticamente (Yahoo Finance)")
+                st.caption("Clique para buscar os dados mais recentes do balanço e DRE diretamente do Yahoo Finance.")
+                if st.button("🔄 Buscar balanço automático agora", type="primary"):
+                    with st.spinner(f"Buscando dados de {emp['ticker']} no Yahoo Finance..."):
+                        try:
+                            dados = calc.buscar_balanco_yfinance(emp["ticker"])
+                            if dados.get("data_referencia"):
+                                dados["empresa_id"] = emp_id
+                                sb_upsert("balancos_dre", {k:v for k,v in dados.items() if v is not None})
+                                st.success(f"✅ Balanço de {dados['data_referencia']} importado automaticamente!")
+                                st.rerun()
+                            else:
+                                st.warning("Dados encontrados mas sem data de referência. Use o lançamento manual.")
+                        except Exception as e:
+                            st.error(f"Erro ao buscar no Yahoo Finance: {e}")
+                            st.info("Verifique se o ticker está correto (ex.: TRIS3, B3SA3) e tente novamente.")
+
+                st.markdown("---")
+                st.subheader("✏️ Ou lance manualmente")
                 with st.form("fluxo_balanco"):
                     data_ref = st.text_input("Data de referência", "2024-12-31")
                     c1,c2,c3 = st.columns(3)
@@ -347,49 +367,79 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                         "ebit": c1.number_input("EBIT",value=0.0),
                         "depreciacao_amortizacao": c2.number_input("Depreciação",value=0.0),
                         "capex": c3.number_input("CAPEX",value=0.0),
-                        "fonte": "Lançado via Fluxo de Análise"
+                        "fonte": "Lançado manualmente"
                     }
-                    if st.form_submit_button("💾 Salvar balanço"):
+                    if st.form_submit_button("💾 Salvar balanço manual"):
                         sb_upsert("balancos_dre", dados_bal)
                         st.success("Balanço salvo.")
                         st.rerun()
 
             elif step == 2:
-                st.write("**Etapa 2 — Indicadores e valor intrínseco.**")
+                st.write("**Etapa 2 — Indicadores e Valor Intrínseco**")
+                st.caption("CDI e Selic são buscados automaticamente do banco de índices. WACC = Selic + 4%.")
                 bals = sb_select("balancos_dre","*", filtros={"empresa_id": emp_id}, ordem="data_referencia")
                 if not bals:
                     st.warning("Sem balanço. Volte para a Etapa 1.")
                 else:
                     datas = [b["data_referencia"] for b in bals]
-                    data_ref = st.selectbox("Data", datas)
+                    data_ref = st.selectbox("Data de referência", datas, key="fluxo_data_ref")
                     bal = next(b for b in bals if b["data_referencia"] == data_ref)
+
+                    sb = get_supabase()
+                    cdi_anual, selic_anual = calc.buscar_cdi_selic_atual(sb)
+                    st.info(f"📊 CDI anual: **{cdi_anual:.2f}%** | Selic anual: **{selic_anual:.2f}%** | WACC: **{selic_anual+4:.2f}%** (Selic + 4%)")
+
                     ind = calc.calcular_indicadores(bal)
-                    st.dataframe(pd.DataFrame([{"Indicador":k,"Valor":round(v,4) if v else None} for k,v in ind.items()]), use_container_width=True)
-                    if st.button("💾 Gravar indicadores"):
+                    st.subheader("Indicadores fundamentalistas")
+                    st.dataframe(pd.DataFrame([{"Indicador":k,"Valor":round(v,4) if v is not None else "—"} for k,v in ind.items()]), use_container_width=True)
+
+                    if st.button("💾 Gravar indicadores no banco"):
                         inds_def = sb_select("indicadores_definicao","id,nome")
                         for nome, valor in ind.items():
                             match = next((x for x in inds_def if x["nome"]==nome), None)
                             if match and valor is not None:
                                 sb_upsert("indicadores_calculados",{"empresa_id":emp_id,"data_referencia":data_ref,"indicador_id":match["id"],"valor":valor})
-                        st.success("Indicadores gravados.")
-                    c1,c2,c3 = st.columns(3)
-                    g = c1.number_input("g (%)",value=6.0,key="fg")
-                    y = c2.number_input("Y (%)",value=6.5,key="fy")
-                    wacc = c3.number_input("WACC (%)",value=10.0,key="fw")
-                    lpa,vpa,fcf = ind.get("LPA"),ind.get("VPA"),ind.get("FCF")
-                    preco = bal.get("preco_mercado_referencia")
-                    vi_s = calc.graham_simplificado(lpa,g=g)
-                    vi_c = calc.graham_complexo(lpa,g,y)
-                    vi_f,_ = calc.fluxo_caixa_descontado(fcf,g/100,wacc/100,anos=5,g_terminal=0.03,divida_liquida=bal.get("net_debt") or 0,num_acoes=bal.get("share_issued"))
-                    r1,r2,r3 = st.columns(3)
-                    r1.metric("Graham Simplif.",f"R$ {vi_s:.2f}" if vi_s else "—")
-                    r2.metric("Graham Complexo",f"R$ {vi_c:.2f}" if vi_c else "—")
-                    r3.metric("FCD",f"R$ {vi_f:.2f}" if vi_f else "—")
-                    if st.button("💾 Gravar valores intrínsecos"):
-                        pr = json.dumps({"g":g,"y":y,"wacc":wacc})
-                        for metodo,vi in [("simplificado",vi_s),("complexo",vi_c),("fcd",vi_f)]:
-                            if vi: sb_upsert("valor_intrinseco",{"empresa_id":emp_id,"data_referencia":data_ref,"metodo":metodo,"valor":vi,"premissas_json":{"g":g,"y":y,"wacc":wacc}})
-                        st.success("Valores intrínsecos gravados.")
+                        st.success("✅ Indicadores gravados.")
+
+                    st.markdown("---")
+                    st.subheader("Valor Intrínseco")
+                    g_auto = 6.0
+                    historico_lucros = [b.get("net_income") for b in sorted(bals, key=lambda x: x["data_referencia"]) if b.get("net_income")]
+                    if len(historico_lucros) >= 2:
+                        g_auto = round(calc.calcular_g_cagr(historico_lucros), 2)
+                        st.caption(f"Taxa g calculada pelo CAGR do lucro: **{g_auto:.2f}%**")
+
+                    g = st.number_input("Taxa de crescimento g (%) — ajuste se necessário", value=g_auto, step=0.5, key="fluxo_g")
+
+                    resultado_vi = calc.calcular_valor_intrinseco_completo(
+                        bal, g_pct=g, cdi_pct=cdi_anual, selic_pct=selic_anual, anos_fcd=5, g_terminal_pct=3.0)
+
+                    r1,r2,r3,r4 = st.columns(4)
+                    r1.metric("Graham Simplif.", f"R$ {resultado_vi['vi_simplificado']:.2f}" if resultado_vi['vi_simplificado'] else "—")
+                    r2.metric("Número Graham",   f"R$ {resultado_vi['vi_numero_graham']:.2f}" if resultado_vi['vi_numero_graham'] else "—")
+                    r3.metric("Graham Complexo", f"R$ {resultado_vi['vi_complexo']:.2f}" if resultado_vi['vi_complexo'] else "—")
+                    r4.metric("FCD",             f"R$ {resultado_vi['vi_fcd']:.2f}" if resultado_vi['vi_fcd'] else "—")
+
+                    preco = resultado_vi['preco_mercado']
+                    vi_medio = resultado_vi['vi_medio']
+                    margem = resultado_vi['margem_seguranca_pct']
+                    classe = resultado_vi['classificacao']
+                    if preco and vi_medio:
+                        cor = "green" if classe=="Comprar" else ("orange" if classe=="Observar" else "red")
+                        st.markdown(f"**Preço:** R$ {preco:.2f} | **VI médio:** R$ {vi_medio:.2f} | **Margem:** {margem:.1f}% | **:{cor}[{classe}]**")
+
+                    with st.expander("Ver premissas e detalhe do FCD"):
+                        st.json(resultado_vi['premissas'])
+
+                    if st.button("💾 Gravar valores intrínsecos no banco"):
+                        for metodo, vi in [("simplificado",resultado_vi['vi_simplificado']),
+                                           ("numero_graham",resultado_vi['vi_numero_graham']),
+                                           ("complexo",resultado_vi['vi_complexo']),
+                                           ("fcd",resultado_vi['vi_fcd'])]:
+                            if vi:
+                                sb_upsert("valor_intrinseco",{"empresa_id":emp_id,"data_referencia":data_ref,
+                                    "metodo":metodo,"valor":vi,"premissas_json":resultado_vi['premissas']})
+                        st.success("✅ Todos os valores intrínsecos gravados.")
 
             elif step == 3:
                 st.write("**Etapa 3 — Avaliação qualitativa.**")
