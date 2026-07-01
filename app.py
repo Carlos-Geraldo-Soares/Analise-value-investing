@@ -75,79 +75,177 @@ def minhas_carteiras():
 
 # ================================================================
 if pagina == "0. Screening de Ações":
-    st.header("Screening — Seleção de Ações por Filtro")
-    setores = sb_select("setores", "id,nome", ordem="nome")
-    setores_df = pd.DataFrame(setores) if setores else pd.DataFrame(columns=["id","nome"])
-    c1,c2,c3,c4,c5 = st.columns(5)
-    pl_max = c1.number_input("P/L máximo", value=15.0)
-    usar_pl = c1.checkbox("Aplicar filtro P/L", value=True)
-    roe_min = c2.number_input("ROE mínimo (%)", value=12.0)
-    usar_roe = c2.checkbox("Aplicar filtro ROE", value=True)
-    lucro_min = c3.number_input("Lucro líquido mínimo", value=0.0)
-    usar_lucro = c3.checkbox("Aplicar filtro Lucro", value=False)
-    divliq_max = c4.number_input("Dív.Líq/PL máximo", value=1.0)
-    usar_div = c4.checkbox("Aplicar filtro Dív/PL", value=False)
-    setor_nome = c5.selectbox("Setor", ["Todos"] + [s["nome"] for s in setores])
+    st.header("Screening — Seleção de Ações da B3")
+    st.caption("Busca **todas as ações da B3** no Fundamentus em tempo real e aplica seus filtros. "
+               "As ações selecionadas entram na lista de análise — só aí você decide quais cadastrar "
+               "no banco para análise completa (balanço, valor intrínseco etc.).")
 
-    if st.button("🔍 Buscar ações"):
-        # Para o Supabase, a função de screening vai direto na tabela
-        # (sem conexão SQLite) — usa a mesma lógica mas via API
-        from supabase import create_client
-        sb = get_supabase()
-        q = sb.table("balancos_dre").select(
-            "empresa_id,data_referencia,net_income,total_equity,net_debt,share_issued,preco_mercado_referencia,"
-            "empresas!inner(id,ticker,razao_social,setores!inner(nome))"
-        )
-        rows = q.execute().data or []
-        # pega só o balanço mais recente por empresa
-        latest = {}
-        for r in rows:
-            eid = r["empresa_id"]
-            if eid not in latest or r["data_referencia"] > latest[eid]["data_referencia"]:
-                latest[eid] = r
-        resultado = []
-        for r in latest.values():
-            emp = r.get("empresas", {})
-            setor_r = (emp.get("setores") or {}).get("nome","")
-            if setor_nome != "Todos" and setor_r != setor_nome:
-                continue
-            share = r.get("share_issued")
-            ni = r.get("net_income")
-            eq = r.get("total_equity")
-            nd = r.get("net_debt")
-            preco = r.get("preco_mercado_referencia")
-            lpa = ni/share if (ni and share) else None
-            roe = ni/eq*100 if (ni and eq) else None
-            pl = preco/lpa if (preco and lpa) else None
-            dpl = nd/eq if (nd and eq) else None
-            if usar_pl and (pl is None or pl > pl_max): continue
-            if usar_roe and (roe is None or roe < roe_min): continue
-            if usar_lucro and (ni is None or ni < lucro_min): continue
-            if usar_div and (dpl is None or dpl > divliq_max): continue
-            resultado.append({"ticker": emp.get("ticker"), "razao_social": emp.get("razao_social"),
-                               "setor": setor_r, "data_referencia": r["data_referencia"],
-                               "P/L": round(pl,2) if pl else None, "ROE (%)": round(roe,2) if roe else None,
-                               "Lucro Líquido": ni, "Dív.Líq/PL": round(dpl,2) if dpl else None,
-                               "empresa_id": r["empresa_id"]})
-        st.session_state["screening_resultado"] = resultado
+    # ── Configuração dos filtros ──────────────────────────────────
+    st.subheader("Configure os filtros")
+    st.caption("Defina o sinal (≤ menor ou igual, ≥ maior ou igual, = igual) e o valor limite de cada indicador.")
 
-    if "screening_resultado" in st.session_state:
-        resultado = st.session_state["screening_resultado"]
-        if not resultado:
-            st.warning("Nenhuma ação encontrada.")
+    INDICADORES_SCREEN = [
+        ("P/L",         "pl",    "≤", 15.0,  True),
+        ("P/VP",        "pvp",   "≤", 1.5,   False),
+        ("ROE (%)",     "roe",   "≥", 12.0,  True),
+        ("ROIC (%)",    "roic",  "≥", 10.0,  False),
+        ("Div.Yield(%)", "dy",   "≥", 0.0,   False),
+        ("Margem Líq.(%)", "mrgliq", "≥", 10.0, False),
+        ("Dív/PL",      "divpl", "≤", 1.0,   False),
+        ("EV/EBITDA",   "evebitda","≤", 8.0, False),
+        ("P/EBITDA",    "pebitda", "≤", 8.0, False),
+        ("Cresc.Rec.5a(%)", "cagr5", "≥", 0.0, False),
+        ("Liq. Corrente","liqc",  "≥", 1.0,  False),
+        ("Liquidez (Vol.)", "liq2meses", "≥", 1000000.0, False),
+    ]
+
+    # Inicializar estado dos filtros
+    if "filtros_screen" not in st.session_state:
+        st.session_state["filtros_screen"] = {
+            ind[1]: {"sinal": ind[2], "valor": ind[3], "ativo": ind[4]}
+            for ind in INDICADORES_SCREEN
+        }
+
+    SINAIS = ["≤", "≥", "="]
+    cols_head = st.columns([3, 2, 2, 1])
+    cols_head[0].markdown("**Indicador**")
+    cols_head[1].markdown("**Sinal**")
+    cols_head[2].markdown("**Valor limite**")
+    cols_head[3].markdown("**Ativo**")
+
+    for nome, chave, sinal_def, val_def, ativo_def in INDICADORES_SCREEN:
+        estado = st.session_state["filtros_screen"][chave]
+        c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+        c1.write(nome)
+        novo_sinal = c2.selectbox(" ", SINAIS,
+                                   index=SINAIS.index(estado["sinal"]),
+                                   key=f"sinal_{chave}", label_visibility="collapsed")
+        novo_val = c3.number_input(" ", value=float(estado["valor"]),
+                                    key=f"val_{chave}", label_visibility="collapsed")
+        novo_ativo = c4.checkbox(" ", value=estado["ativo"],
+                                  key=f"ativo_{chave}", label_visibility="collapsed")
+        st.session_state["filtros_screen"][chave] = {
+            "sinal": novo_sinal, "valor": novo_val, "ativo": novo_ativo}
+
+    setor_filtro = st.selectbox("Filtrar por setor (opcional)",
+                                 ["Todos"] + [s["nome"] for s in sb_select("setores","nome",ordem="nome")])
+
+    st.markdown("---")
+    col_btn1, col_btn2 = st.columns([2, 5])
+    buscar = col_btn1.button("🔍 Buscar ações na B3 (Fundamentus)", type="primary")
+    col_btn2.caption("Busca todas as ações da B3 em tempo real — pode levar 10 a 30 segundos.")
+
+    if buscar:
+        with st.spinner("Buscando todas as ações da B3 no Fundamentus... aguarde."):
+            try:
+                import fundamentus
+                df_fund = fundamentus.get_resultado()
+                df_fund = df_fund.reset_index()
+                df_fund.columns = [str(c).strip().lower() for c in df_fund.columns]
+
+                # mapa de colunas do Fundamentus para nossos nomes
+                mapa_cols = {
+                    "papel": "ticker", "nome": "razao_social", "setor": "setor",
+                    "p/l": "pl", "p/vp": "pvp", "roe": "roe", "roic": "roic",
+                    "div.yield": "dy", "mrg. líq.": "mrgliq", "dív/patrim.": "divpl",
+                    "ev/ebitda": "evebitda", "p/ebitda": "pebitda",
+                    "cresc. rec.5a": "cagr5", "liq. corr.": "liqc",
+                    "liq.2meses": "liq2meses", "patrim. líq": "pl_val",
+                }
+                df_fund = df_fund.rename(columns={k: v for k, v in mapa_cols.items() if k in df_fund.columns})
+
+                # converter colunas numéricas
+                for col in ["pl","pvp","roe","roic","dy","mrgliq","divpl","evebitda","pebitda","cagr5","liqc","liq2meses"]:
+                    if col in df_fund.columns:
+                        df_fund[col] = pd.to_numeric(df_fund[col], errors="coerce")
+
+                # converter ROE e outros para % se estiverem em decimal
+                for col in ["roe","roic","dy","mrgliq","cagr5"]:
+                    if col in df_fund.columns:
+                        # Fundamentus já retorna em % (ex: 0.15 = 15%)
+                        if df_fund[col].abs().max() < 5:
+                            df_fund[col] = df_fund[col] * 100
+
+                # aplicar filtros
+                filtros = st.session_state["filtros_screen"]
+                mask = pd.Series([True] * len(df_fund), index=df_fund.index)
+                for chave, cfg in filtros.items():
+                    if not cfg["ativo"] or chave not in df_fund.columns:
+                        continue
+                    val = cfg["valor"]
+                    sinal = cfg["sinal"]
+                    col_series = pd.to_numeric(df_fund[chave], errors="coerce")
+                    if sinal == "≤":
+                        mask &= col_series <= val
+                    elif sinal == "≥":
+                        mask &= col_series >= val
+                    elif sinal == "=":
+                        mask &= col_series == val
+
+                df_result = df_fund[mask].copy()
+
+                if setor_filtro != "Todos" and "setor" in df_result.columns:
+                    df_result = df_result[df_result["setor"].str.contains(setor_filtro, case=False, na=False)]
+
+                st.session_state["screening_resultado_fund"] = df_result
+                st.session_state["screening_total_fund"] = len(df_fund)
+
+            except Exception as e:
+                st.error(f"Erro ao buscar dados no Fundamentus: {e}")
+                st.info("Verifique se o Streamlit Cloud tem acesso à internet para o Fundamentus. "
+                        "Se o erro persistir, tente novamente em alguns minutos.")
+
+    if "screening_resultado_fund" in st.session_state:
+        df_result = st.session_state["screening_resultado_fund"]
+        total = st.session_state.get("screening_total_fund", "?")
+
+        if df_result.empty:
+            st.warning(f"Nenhuma ação passou pelos filtros (de {total} ações consultadas). "
+                       "Tente afrouxar algum critério.")
         else:
-            df_res = pd.DataFrame(resultado)
-            st.success(f"{len(df_res)} ação(ões) encontrada(s).")
-            escolhidas = st.multiselect("Selecione quais ações analisar (1 a 10)",
-                                         df_res["ticker"].tolist(), max_selections=10, key="screening_escolhidas")
-            st.dataframe(df_res.drop(columns=["empresa_id"]), use_container_width=True)
-            if escolhidas and st.button("💾 Guardar seleção para analisar uma a uma"):
+            st.success(f"✅ {len(df_result)} ação(ões) encontrada(s) de {total} consultadas.")
+
+            # colunas a exibir
+            cols_exibir = [c for c in ["ticker","razao_social","setor","pl","pvp","roe","roic",
+                                         "dy","mrgliq","divpl","evebitda","liqc"] if c in df_result.columns]
+            df_show = df_result[cols_exibir].copy()
+            df_show.columns = [c.upper() for c in df_show.columns]
+            st.dataframe(df_show, use_container_width=True)
+
+            st.subheader("Selecione as ações para analisar")
+            tickers_disp = df_result["ticker"].tolist() if "ticker" in df_result.columns else []
+            escolhidas = st.multiselect(
+                "Escolha de 1 a 10 ações para guardar na lista de análise",
+                tickers_disp, max_selections=10, key="screening_escolhidas_fund")
+
+            if escolhidas and st.button("💾 Guardar seleção para analisar uma a uma", type="primary"):
                 uid = usuario_id()
+                cadastradas = 0
                 for tk in escolhidas:
-                    eid = int(df_res[df_res["ticker"]==tk]["empresa_id"].iloc[0])
-                    sb_upsert("lista_analise", {"empresa_id": eid, "usuario_id": uid,
-                               "data_selecao": pd.Timestamp.now().isoformat(), "status": "pendente"})
-                st.success(f"{len(escolhidas)} ação(ões) guardada(s) em 'Minha Lista de Análise'.")
+                    # verifica se empresa já existe no banco; se não, cria automaticamente
+                    emps = sb_select("empresas", "id", filtros={"ticker": tk})
+                    if emps:
+                        eid = emps[0]["id"]
+                    else:
+                        # busca dados da empresa no resultado do Fundamentus
+                        row_fund = df_result[df_result["ticker"] == tk]
+                        nome_emp = row_fund["razao_social"].iloc[0] if "razao_social" in row_fund.columns and not row_fund.empty else tk
+                        r_emp = sb_insert("empresas", {"ticker": tk, "razao_social": str(nome_emp), "ativo": True})
+                        eid = r_emp[0]["id"] if r_emp else None
+                        cadastradas += 1
+                    if eid:
+                        sb_upsert("lista_analise", {
+                            "empresa_id": eid, "usuario_id": uid,
+                            "data_selecao": pd.Timestamp.now().isoformat(),
+                            "status": "pendente",
+                            "origem": json.dumps({"fonte": "Fundamentus", "filtros_ativos":
+                                [k for k,v in st.session_state["filtros_screen"].items() if v["ativo"]]})
+                        })
+                if cadastradas:
+                    st.info(f"{cadastradas} empresa(s) nova(s) criada(s) automaticamente no banco.")
+                st.success(f"✅ {len(escolhidas)} ação(ões) guardada(s) em 'Minha Lista de Análise'. "
+                           "Vá para a Tela 0b para começar a análise.")
+
 
 # ================================================================
 elif pagina == "0b. Minha Lista de Análise":
@@ -555,30 +653,134 @@ elif pagina == "11. Administração de Usuários":
 # ================================================================
 elif pagina == "9. Índices Macroeconômicos":
     st.header("Índices Macroeconômicos")
-    aba_imp_i, aba_man_i = st.tabs(["📥 Importar Excel","✏️ Cadastrar"])
+    st.caption("IPCA, CDI, IGP-M, Selic e Ibovespa — série histórica completa e valores mensais. "
+               "Usados como referência no Graham complexo, WACC do FCD e comparativo de rentabilidade da carteira.")
+
+    INDICES_LISTA = ["CDI", "Selic", "IPCA", "IGP-M", "Ibovespa"]
+
+    aba_imp_i, aba_man_i, aba_hist_i = st.tabs([
+        "📥 Importar série histórica (Excel)", "✏️ Cadastrar valor mensal", "📊 Histórico"])
+
     with aba_imp_i:
-        arq_i = st.file_uploader("Arquivo .xlsx (colunas: Índice, Data, Valor)", type=["xlsx"], key="idx_up")
+        st.write("Use o **template padronizado** (baixe abaixo) para montar a série histórica de qualquer índice.")
+        st.caption("Layout: **Ano | Mês | No mês | Em 3 meses | Em 6 meses | No Ano | Em 12 meses**. "
+                   "O nome do índice fica na célula A1 da planilha. Campos opcionais podem ficar em branco.")
+
+        indicador_imp = st.selectbox("Qual índice você está importando?", INDICES_LISTA, key="imp_idx_nome")
+        arq_i = st.file_uploader("Selecione o arquivo Excel (.xlsx)", type=["xlsx"], key="idx_up")
+
         if arq_i:
-            df_i = pd.read_excel(arq_i)
-            st.dataframe(df_i.head(20), use_container_width=True)
-            if st.button("✅ Importar índices"):
-                qtd_i, av_i = calc.importar_indices_excel(None, df_i, arquivo_origem=arq_i.name)
-                st.info("Use a aba manual para lançar os índices individualmente por enquanto — "
-                        "a importação em lote via Supabase está prevista para a próxima versão.")
+            # lê a partir da linha 2 (cabeçalho) — linha 1 é o nome do índice
+            df_raw = pd.read_excel(arq_i, header=None)
+            # linha 0 = nome do índice, linha 1 = cabeçalho, linha 2+ = dados
+            cabecalho_row = 1
+            df_i = pd.read_excel(arq_i, header=cabecalho_row)
+            # remove linhas de instrução (aviso em laranja) se existir
+            df_i = df_i.dropna(subset=[df_i.columns[0]])
+            df_i = df_i[pd.to_numeric(df_i.iloc[:,0], errors="coerce").notna()]
+            st.write(f"Pré-visualização ({len(df_i)} registros):")
+            st.dataframe(df_i.head(10), use_container_width=True)
+
+            if st.button("✅ Confirmar importação"):
+                # processar com a nova função
+                import calendar as cal_mod
+                import unicodedata
+
+                def norm(c):
+                    c = str(c).strip().lower()
+                    c = "".join(x for x in unicodedata.normalize("NFKD",c) if not unicodedata.combining(x))
+                    return c.replace(" ","_")
+
+                df_proc = df_i.copy()
+                df_proc.columns = [norm(c) for c in df_proc.columns]
+                cols = list(df_proc.columns)
+
+                col_no_mes = next((c for c in cols if "no_mes" in c), None)
+                col_3m = next((c for c in cols if "3" in c and "mes" in c), None)
+                col_6m = next((c for c in cols if "6" in c and "mes" in c), None)
+                col_no_ano = next((c for c in cols if "no_ano" in c), None)
+                col_12m = next((c for c in cols if "12" in c), None)
+
+                registros = []
+                avisos_imp = []
+                importadas = 0
+                for _, row in df_proc.iterrows():
+                    try:
+                        ano, mes = int(row["ano"]), int(row["mes"])
+                    except Exception:
+                        continue
+                    ultimo_dia = cal_mod.monthrange(ano, mes)[1]
+                    data_str = f"{ano:04d}-{mes:02d}-{ultimo_dia:02d}"
+
+                    def safe(col):
+                        if col is None: return None
+                        v = row.get(col)
+                        if v is None or str(v).strip() in ("","nan","None"): return None
+                        try: return float(v)
+                        except: return None
+
+                    no_mes_v = safe(col_no_mes)
+                    if no_mes_v is None:
+                        continue
+
+                    reg = {"indice": indicador_imp, "data_referencia": data_str,
+                           "valor": no_mes_v, "no_mes": no_mes_v, "fonte": arq_i.name}
+                    if col_3m: reg["em_3_meses"] = safe(col_3m)
+                    if col_6m: reg["em_6_meses"] = safe(col_6m)
+                    if col_no_ano: reg["no_ano"] = safe(col_no_ano)
+                    if col_12m: reg["em_12_meses"] = safe(col_12m)
+                    reg = {k:v for k,v in reg.items() if v is not None}
+                    registros.append(reg)
+                    importadas += 1
+
+                if registros:
+                    sb = get_supabase()
+                    sb.table("indices_macroeconomicos").upsert(registros).execute()
+                    st.success(f"✅ {importadas} registro(s) de {indicador_imp} importado(s) com sucesso!")
+                    for a in avisos_imp:
+                        st.warning(a)
+                    st.rerun()
+                else:
+                    st.error("Nenhum registro válido encontrado. Verifique o formato do arquivo.")
+
     with aba_man_i:
+        st.caption("Para atualizar o valor do mês atual sem precisar de uma planilha.")
         with st.form("form_idx"):
-            c1,c2,c3,c4 = st.columns(4)
-            ind_n = c1.selectbox("Índice",["Selic","CDI","IPCA","IGP-M","Ibovespa"])
-            dt_i = c2.text_input("Data")
-            vl_i = c3.number_input("Valor",value=0.0)
-            ft_i = c4.text_input("Fonte","Banco Central/B3")
-            if st.form_submit_button("Salvar") and dt_i:
-                sb_upsert("indices_macroeconomicos",{"indice":ind_n,"data_referencia":dt_i,"valor":vl_i,"fonte":ft_i})
-                st.success("Índice salvo."); st.rerun()
-    filtro_i = st.selectbox("Filtrar por índice",["Todos","Selic","CDI","IPCA","IGP-M","Ibovespa"])
-    hist_i = sb_select("indices_macroeconomicos","indice,data_referencia,valor,fonte",
-                        filtros={"indice":filtro_i} if filtro_i!="Todos" else None, ordem="data_referencia")
-    st.dataframe(pd.DataFrame(hist_i), use_container_width=True)
+            c1, c2 = st.columns(2)
+            ind_n = c1.selectbox("Índice", INDICES_LISTA)
+            ano_m = c1.number_input("Ano", value=2026, step=1)
+            mes_m = c2.selectbox("Mês", list(range(1,13)))
+            no_mes_m = c2.number_input("No mês (%)", value=0.0, step=0.01)
+            c3, c4 = st.columns(2)
+            no_ano_m = c3.number_input("No Ano (acumulado, opcional)", value=0.0)
+            em_12m_m = c4.number_input("Em 12 meses (opcional)", value=0.0)
+            fonte_m = st.text_input("Fonte", "Banco Central do Brasil / B3")
+            if st.form_submit_button("💾 Salvar") and ano_m and mes_m:
+                import calendar as cal_m
+                ult = cal_m.monthrange(int(ano_m), int(mes_m))[1]
+                data_m = f"{int(ano_m):04d}-{int(mes_m):02d}-{ult:02d}"
+                reg = {"indice": ind_n, "data_referencia": data_m,
+                       "valor": no_mes_m, "no_mes": no_mes_m, "fonte": fonte_m}
+                if no_ano_m: reg["no_ano"] = no_ano_m
+                if em_12m_m: reg["em_12_meses"] = em_12m_m
+                sb_upsert("indices_macroeconomicos", reg)
+                st.success(f"{ind_n} {int(ano_m)}/{int(mes_m):02d} salvo.")
+                st.rerun()
+
+    with aba_hist_i:
+        filtro_i = st.selectbox("Filtrar por índice", ["Todos"] + INDICES_LISTA)
+        hist_i = sb_select("indices_macroeconomicos",
+                            "indice,data_referencia,no_mes,em_3_meses,em_6_meses,no_ano,em_12_meses,fonte",
+                            filtros={"indice": filtro_i} if filtro_i != "Todos" else None,
+                            ordem="data_referencia")
+        df_hist = pd.DataFrame(hist_i) if hist_i else pd.DataFrame()
+        if not df_hist.empty:
+            df_hist.columns = ["Índice","Data","No mês","Em 3 meses","Em 6 meses","No Ano","Em 12 meses","Fonte"]
+            st.dataframe(df_hist, use_container_width=True)
+            st.caption(f"Total: {len(df_hist)} registros.")
+        else:
+            st.info("Nenhum registro. Importe a série histórica ou cadastre valores na aba ao lado.")
+
 
 # ================================================================
 elif pagina == "10. Tabelas de Apoio":
