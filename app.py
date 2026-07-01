@@ -144,13 +144,28 @@ if pagina == "0. Screening de Ações":
                 df_fund.columns = [str(c).strip().lower() for c in df_fund.columns]
 
                 # mapa de colunas do Fundamentus para nossos nomes
+                # normaliza os nomes das colunas antes de mapear
+                def norm_col(c):
+                    import unicodedata
+                    c = str(c).strip().lower()
+                    c = "".join(x for x in unicodedata.normalize("NFKD",c) if not unicodedata.combining(x))
+                    return c.replace(" ","_").replace("/","_").replace(".","_").replace("__","_")
+
+                df_fund.columns = [norm_col(c) for c in df_fund.columns]
+
+                # mapa flexível — cobre variações de nome do Fundamentus
                 mapa_cols = {
                     "papel": "ticker", "nome": "razao_social", "setor": "setor",
-                    "p/l": "pl", "p/vp": "pvp", "roe": "roe", "roic": "roic",
-                    "div.yield": "dy", "mrg. líq.": "mrgliq", "dív/patrim.": "divpl",
-                    "ev/ebitda": "evebitda", "p/ebitda": "pebitda",
-                    "cresc. rec.5a": "cagr5", "liq. corr.": "liqc",
-                    "liq.2meses": "liq2meses", "patrim. líq": "pl_val",
+                    "p_l": "pl", "p_vp": "pvp",
+                    "roe": "roe", "roic": "roic",
+                    "div_yield": "dy",
+                    "mrg_liq_": "mrgliq", "mrg__liq_": "mrgliq",
+                    "div_patrim_": "divpl", "div_brut__patrim_": "divpl",
+                    "ev_ebitda": "evebitda", "p_ebitda": "pebitda",
+                    "cresc__rec_5a": "cagr5", "cresc_rec_5a": "cagr5",
+                    "liq__corr_": "liqc", "liq_corr_": "liqc",
+                    "liq_2meses": "liq2meses",
+                    "patrim__liq": "pl_val", "patrim_liq": "pl_val",
                 }
                 df_fund = df_fund.rename(columns={k: v for k, v in mapa_cols.items() if k in df_fund.columns})
 
