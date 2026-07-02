@@ -1,15 +1,26 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v1.1
-GERADO EM: 2026-07-02 03:45 (horário de geração pelo assistente)
-ÚLTIMA MUDANÇA: Adicionado cabeçalho de versão/data para controle de cópia.
+VERSÃO DESTE ARQUIVO: v1.2
+GERADO EM: 2026-07-02 04:20 (horário de geração pelo assistente)
+ÚLTIMA MUDANÇA: Tela de Empresas redesenhada.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
   cotação em tempo real via yfinance, cadastro/edição de empresa com rating e
   dados de banco, Índice de Boa Empresa (cálculo + tela de screening).
 - v1.1 (2026-07-02): Cabeçalho de versão adicionado.
+- v1.2 (2026-07-02): Tela de Empresas reestruturada — ticker vira lista (uma
+  empresa pode ter vários, ex: PETR3/PETR4) usando a tabela ativos_empresa;
+  "Tipo mercado" agora representa Segmento de listagem B3 (Novo Mercado,
+  Nível 1/2, Tradicional), separado de "Tipo de ativo"; Rating virou botão de
+  busca (links de conferência manual, já que não há fonte pública raspável)
+  + formulário de edição manual; todos os campos exceto Ticker e Razão Social
+  agora são opcionais, com mensagem de erro clara quando falta algo
+  obrigatório; "Novo setor" foi movido para a tela 10 (Tabelas de Apoio);
+  botões de Indicadores / Análise de Boa Empresa / Histórico de Lucros /
+  Notícias Relevantes / Futuro da Empresa agora só aparecem em modo edição
+  (empresa já salva), não durante o cadastro de uma nova empresa.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -451,6 +462,74 @@ def calcular_indice_boa_empresa(emp, ind=None, preco=None, vi_medio=None,
     }
 
 
+def renderizar_diagnostico_boa_empresa(emp_id, emp, permitir_salvar=True):
+    """
+    Busca tudo que é preciso (balanço, indicadores, VI, avaliação qualitativa,
+    dados de banco, histórico de lucros) e desenha o diagnóstico do Índice de
+    Boa Empresa na tela. Reaproveitado no Fluxo Guiado e na tela de Empresas.
+    Nunca estoura erro — se faltar balanço, avisa e para por aí.
+    """
+    bals = sb_select("balancos_dre", "*", filtros={"empresa_id": emp_id}, ordem="data_referencia")
+    if not bals:
+        st.warning("Sem balanço cadastrado para esta empresa ainda. "
+                   "Lance um balanço (Fluxo de Análise guiado, Etapa 1) para calcular o diagnóstico.")
+        return
+    bal = bals[-1]
+    ind = calc.calcular_indicadores(bal)
+    preco = bal.get("preco_mercado_referencia")
+    vis = sb_select("valor_intrinseco", "metodo,valor",
+                     filtros={"empresa_id": emp_id, "data_referencia": bal["data_referencia"]})
+    vi_medio = (sum(v["valor"] for v in vis) / len(vis)) if vis else None
+    av = sb_select("avaliacao_qualitativa_buffett", "*", filtros={"empresa_id": emp_id})
+    banco_reg = sb_select("bancos_dados", "*", filtros={"empresa_id": emp_id}) if emp.get("eh_banco") else []
+    historico_lucros = [b.get("net_income") for b in sorted(bals, key=lambda x: x["data_referencia"])
+                         if b.get("net_income") is not None]
+
+    resultado = calcular_indice_boa_empresa(
+        emp=emp, ind=ind, preco=preco, vi_medio=vi_medio,
+        av=(av[0] if av else {}), banco_dados=(banco_reg[0] if banco_reg else {}),
+        historico_lucros=historico_lucros,
+    )
+    cor = {"Boa empresa": "green", "Observar": "orange", "Evitar": "red"}[resultado["classificacao"]]
+    st.markdown(f"### Nota final: **{resultado['nota_final']}/100** — :{cor}[{resultado['classificacao']}]")
+    b1, b2, b3 = st.columns(3)
+    b1.metric(f"Valuation/Rating (30% — {resultado['componente_30_fonte']})",
+              resultado['nota_rating'] if resultado['nota_rating'] is not None else resultado['nota_valuation'])
+    b2.metric("Qualidade Financeira (45%)", resultado['nota_qualidade_financeira'])
+    b3.metric("Qualidade do Negócio (25%)", resultado['nota_qualidade_negocio'])
+    with st.expander("Ver detalhamento critério a critério (para validar)"):
+        st.json(resultado["detalhes"])
+    if permitir_salvar and st.button("💾 Salvar este diagnóstico", key=f"salvar_ibe_{emp_id}"):
+        sb_upsert("indice_boa_empresa", {
+            "empresa_id": emp_id, "data_calculo": date.today().isoformat(),
+            "nota_valuation": resultado["nota_valuation"],
+            "nota_qualidade_financeira": resultado["nota_qualidade_financeira"],
+            "nota_qualidade_negocio": resultado["nota_qualidade_negocio"],
+            "nota_rating": resultado["nota_rating"],
+            "nota_final": resultado["nota_final"],
+            "classificacao": resultado["classificacao"],
+            "detalhes": resultado["detalhes"],
+        })
+        st.success("Diagnóstico salvo.")
+
+
+def buscar_rating_links(nome_empresa):
+    """
+    Não existe fonte pública gratuita e estável para raspar rating de crédito
+    automaticamente (Fitch/Moody's/S&P não expõem isso em página simples).
+    Em vez de fingir uma busca automática que não funcionaria de verdade,
+    devolve links diretos de busca em cada agência para conferência manual rápida.
+    """
+    import urllib.parse
+    q = urllib.parse.quote(nome_empresa)
+    return {
+        "Fitch Ratings": f"https://www.fitchratings.com/search?query={q}",
+        "Moody's": f"https://www.moodys.com/search?keyword={q}",
+        "S&P Global": f"https://www.spglobal.com/ratings/en/search-results?query={q}",
+        "Busca geral": f"https://www.google.com/search?q={q}+rating+de+cr%C3%A9dito",
+    }
+
+
 def lista_empresas():
     dados = sb_select("empresas", "id,ticker,cnpj,razao_social,setor_id,subsetor_id", ordem="ticker")
     return pd.DataFrame(dados) if dados else pd.DataFrame()
@@ -844,7 +923,6 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                     st.warning("Sem balanço. Volte para a Etapa 1.")
                 else:
                     bal = bals[-1]
-                    ind = calc.calcular_indicadores(bal)
                     preco = bal.get("preco_mercado_referencia")
                     vis = sb_select("valor_intrinseco","metodo,valor",filtros={"empresa_id":emp_id,"data_referencia":bal["data_referencia"]})
                     st.markdown(f"#### {emp['ticker']} — {emp['razao_social']}")
@@ -864,36 +942,7 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
 
                     st.markdown("---")
                     st.subheader("⭐ Índice de Boa Empresa")
-                    banco_reg = sb_select("bancos_dados","*",filtros={"empresa_id":emp_id}) if emp.get("eh_banco") else []
-                    historico_lucros = [b.get("net_income") for b in sorted(bals, key=lambda x: x["data_referencia"]) if b.get("net_income") is not None]
-                    resultado_ibe = calcular_indice_boa_empresa(
-                        emp=emp, ind=ind if bals else {}, preco=preco,
-                        vi_medio=(sum(v["valor"] for v in vis)/len(vis)) if vis else None,
-                        av=(av[0] if av else {}), banco_dados=(banco_reg[0] if banco_reg else {}),
-                        historico_lucros=historico_lucros,
-                    )
-                    cor_ibe = {"Boa empresa":"green","Observar":"orange","Evitar":"red"}[resultado_ibe["classificacao"]]
-                    st.markdown(f"### Nota final: **{resultado_ibe['nota_final']}/100** — :{cor_ibe}[{resultado_ibe['classificacao']}]")
-                    b1,b2,b3 = st.columns(3)
-                    b1.metric(f"Valuation/Rating (30% — usando {resultado_ibe['componente_30_fonte']})",
-                              resultado_ibe['nota_rating'] if resultado_ibe['nota_rating'] is not None else resultado_ibe['nota_valuation'])
-                    b2.metric("Qualidade Financeira (45%)", resultado_ibe['nota_qualidade_financeira'])
-                    b3.metric("Qualidade do Negócio (25%)", resultado_ibe['nota_qualidade_negocio'])
-                    with st.expander("Ver detalhamento critério a critério (para validar)"):
-                        st.json(resultado_ibe["detalhes"])
-                    if st.button("💾 Salvar Índice de Boa Empresa"):
-                        sb_upsert("indice_boa_empresa", {
-                            "empresa_id": emp_id,
-                            "data_calculo": date.today().isoformat(),
-                            "nota_valuation": resultado_ibe["nota_valuation"],
-                            "nota_qualidade_financeira": resultado_ibe["nota_qualidade_financeira"],
-                            "nota_qualidade_negocio": resultado_ibe["nota_qualidade_negocio"],
-                            "nota_rating": resultado_ibe["nota_rating"],
-                            "nota_final": resultado_ibe["nota_final"],
-                            "classificacao": resultado_ibe["classificacao"],
-                            "detalhes": resultado_ibe["detalhes"],
-                        })
-                        st.success("Índice de Boa Empresa salvo.")
+                    renderizar_diagnostico_boa_empresa(emp_id, emp)
 
                     st.markdown("---")
                     if st.button("✅ Concluir análise desta ação", type="primary"):
@@ -910,42 +959,32 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
 # ================================================================
 elif pagina == "1. Empresas e Setores":
     st.header("Empresas e Setores")
-    c1,c2 = st.columns(2)
-    with c1:
-        st.subheader("Setores")
-        df_set = pd.DataFrame(sb_select("setores","id,nome",ordem="nome"))
-        if not df_set.empty: st.dataframe(df_set, use_container_width=True)
-        with st.form("form_setor"):
-            ns = st.text_input("Novo setor")
-            if st.form_submit_button("Adicionar") and ns:
-                sb_insert("setores",{"nome":ns}); st.rerun()
-    with c2:
-        st.subheader("Empresas")
-        st.dataframe(lista_empresas(), use_container_width=True)
+    st.dataframe(lista_empresas(), use_container_width=True)
+    st.caption("Para cadastrar um novo Setor, use a tela '10. Tabelas de Apoio'.")
     st.subheader("Cadastrar ou editar empresa")
 
     setores = sb_select("setores","id,nome",ordem="nome")
-    tipos = sb_select("tipo_mercado","codigo",ordem="codigo")
+    tipos_mercado = sb_select("tipo_mercado","codigo",ordem="codigo")
     sits = sb_select("situacao_empresa","codigo",ordem="codigo")
     tipos_ativo = sb_select("tipos_ativo","id,nome",ordem="nome")
 
     # ---- escolher empresa existente pra editar (opcional) ----
     df_emp_edit = lista_empresas()
-    opcoes_edit = ["➕ Nova empresa"] + (
-        list(df_emp_edit["ticker"] + " - " + df_emp_edit["razao_social"]) if not df_emp_edit.empty else []
-    )
-    escolha_edit = st.selectbox("Selecione uma empresa para editar, ou cadastre uma nova", opcoes_edit)
+    mapa_edicao = {"➕ Nova empresa": None}
+    if not df_emp_edit.empty:
+        for _, r in df_emp_edit.iterrows():
+            rotulo = f"{r['razao_social']} ({r['ticker'] or 'sem ticker'})"
+            mapa_edicao[rotulo] = int(r["id"])
+    escolha_edit = st.selectbox("Selecione uma empresa para editar, ou cadastre uma nova", list(mapa_edicao.keys()))
+    empresa_id_edicao = mapa_edicao[escolha_edit]
 
     dados_atuais = {}
     banco_atual = {}
-    empresa_id_edicao = None
-    if escolha_edit != "➕ Nova empresa":
-        ticker_sel = escolha_edit.split(" - ")[0]
-        registro = sb_select("empresas", "*", filtros={"ticker": ticker_sel})
+    tickers_atuais = []
+    if empresa_id_edicao:
+        registro = sb_select("empresas", "*", filtros={"id": empresa_id_edicao})
         if registro:
             dados_atuais = registro[0]
-            empresa_id_edicao = dados_atuais.get("id")
-            # resolve nomes a partir dos IDs (a tabela guarda só os IDs)
             if dados_atuais.get("setor_id"):
                 s_match = next((s for s in setores if s["id"] == dados_atuais["setor_id"]), None)
                 dados_atuais["setor_nome"] = s_match["nome"] if s_match else ""
@@ -955,97 +994,268 @@ elif pagina == "1. Empresas e Setores":
             banco_reg = sb_select("bancos_dados", "*", filtros={"empresa_id": empresa_id_edicao})
             if banco_reg:
                 banco_atual = banco_reg[0]
+            tickers_atuais = sb_select("ativos_empresa", "*", filtros={"empresa_id": empresa_id_edicao}, ordem="codigo") or []
 
+    # ---- Tickers / código(s) da ação — uma empresa pode ter mais de um (ex: PETR3 e PETR4) ----
+    st.markdown("**Ticker(s) / Código(s) da ação**")
+    st.caption("O ticker é o código da ação na bolsa, não uma informação que você digita livremente — "
+               "uma mesma empresa pode ter mais de um (ex: PETR3 e PETR4 são ambos da Petrobras).")
+    if empresa_id_edicao:
+        if tickers_atuais:
+            df_tk = pd.DataFrame(tickers_atuais)
+            df_tk["tipo_ativo"] = df_tk["tipo_ativo_id"].apply(
+                lambda tid: next((t["nome"] for t in tipos_ativo if t["id"] == tid), "—"))
+            st.dataframe(df_tk[["codigo","tipo_ativo","ativo"]], use_container_width=True, hide_index=True)
+        else:
+            st.caption("Nenhum ticker cadastrado ainda para esta empresa.")
+        with st.form("form_add_ticker", clear_on_submit=True):
+            ct1, ct2, ct3 = st.columns([2,2,1])
+            novo_codigo = ct1.text_input("Novo ticker (ex: PETR3)")
+            tipo_ativo_nomes_tk = [t["nome"] for t in tipos_ativo] if tipos_ativo else ["Ação"]
+            novo_tipo_nome = ct2.selectbox("Tipo de ativo", tipo_ativo_nomes_tk, key="novo_tipo_ativo_tk")
+            ct3.write("")
+            if ct3.form_submit_button("➕ Adicionar") :
+                if not novo_codigo.strip():
+                    st.error("❌ Digite o código do ticker antes de adicionar.")
+                else:
+                    ta_id_tk = next((t["id"] for t in tipos_ativo if t["nome"] == novo_tipo_nome), None)
+                    sb_upsert("ativos_empresa", {"empresa_id": empresa_id_edicao, "codigo": novo_codigo.upper(),
+                                                  "tipo_ativo_id": ta_id_tk, "ativo": True})
+                    # se a empresa ainda não tem ticker principal, este vira o principal
+                    if not dados_atuais.get("ticker"):
+                        sb_upsert("empresas", {"id": empresa_id_edicao, "ticker": novo_codigo.upper()})
+                    st.success(f"Ticker {novo_codigo.upper()} adicionado.")
+                    st.rerun()
+    else:
+        st.info("Salve a empresa primeiro (com pelo menos um ticker abaixo) para depois adicionar tickers extras.")
+
+    st.markdown("---")
     with st.form("form_emp"):
         c1,c2,c3 = st.columns(3)
-        ticker = c1.text_input("Ticker", value=dados_atuais.get("ticker",""))
-        razao = c2.text_input("Razão social", value=dados_atuais.get("razao_social",""))
-        cnpj = c3.text_input("CNPJ", value=dados_atuais.get("cnpj",""))
+        ticker_principal = c1.text_input("Ticker principal *", value=dados_atuais.get("ticker","") or "",
+                                          help="Usado para identificar a empresa nas telas de análise. "
+                                               "Se a empresa tiver mais de um ticker, cadastre os demais acima depois de salvar.")
+        razao = c2.text_input("Razão social *", value=dados_atuais.get("razao_social","") or "")
+        cnpj = c3.text_input("CNPJ (opcional)", value=dados_atuais.get("cnpj","") or "")
 
         c4,c5,c6 = st.columns(3)
         setor_nomes = [""]+[s["nome"] for s in setores]
         setor_idx = setor_nomes.index(dados_atuais.get("setor_nome","")) if dados_atuais.get("setor_nome") in setor_nomes else 0
-        setor_nome = c4.selectbox("Setor", setor_nomes, index=setor_idx)
-        segmento = c5.text_input("Segmento", value=dados_atuais.get("segmento","") or "")
+        setor_nome = c4.selectbox("Setor (opcional)", setor_nomes, index=setor_idx)
+        segmento = c5.text_input("Segmento (opcional)", value=dados_atuais.get("segmento","") or "")
         tipo_ativo_nomes = [t["nome"] for t in tipos_ativo] if tipos_ativo else ["Ação"]
         ta_idx = tipo_ativo_nomes.index(dados_atuais.get("tipo_ativo_nome","Ação")) if dados_atuais.get("tipo_ativo_nome") in tipo_ativo_nomes else 0
-        tipo_ativo_nome = c6.selectbox("Tipo de ativo", tipo_ativo_nomes, index=ta_idx)
+        tipo_ativo_nome = c6.selectbox("Tipo de ativo principal (opcional)", tipo_ativo_nomes, index=ta_idx)
 
         c7,c8 = st.columns(2)
-        tipo_m = c7.selectbox("Tipo mercado",[t["codigo"] for t in tipos]) if tipos else c7.text_input("Tipo")
-        sit = c8.selectbox("Situação",[s["codigo"] for s in sits]) if sits else c8.text_input("Situação")
+        tipos_m_opcoes = [""]+[t["codigo"] for t in tipos_mercado] if tipos_mercado else [""]
+        tm_idx = tipos_m_opcoes.index(dados_atuais.get("tipo_mercado_codigo","")) if dados_atuais.get("tipo_mercado_codigo","") in tipos_m_opcoes else 0
+        tipo_m = c7.selectbox("Segmento de listagem B3 (opcional)", tipos_m_opcoes, index=tm_idx,
+                               help="Novo Mercado, Nível 1, Nível 2 ou Tradicional — não confundir com 'Tipo de ativo'.")
+        sits_opcoes = [""]+[s["codigo"] for s in sits] if sits else [""]
+        sit_idx = sits_opcoes.index(dados_atuais.get("situacao_codigo","")) if dados_atuais.get("situacao_codigo","") in sits_opcoes else 0
+        sit = c8.selectbox("Situação (opcional)", sits_opcoes, index=sit_idx)
 
-        na_bolsa = st.checkbox("Empresa negociada na bolsa (B3)",
-                                value=dados_atuais.get("na_bolsa", True))
+        na_bolsa = st.checkbox("Empresa negociada na bolsa (B3)", value=dados_atuais.get("na_bolsa", True))
         if not na_bolsa:
             st.caption("⚠️ Fora da bolsa: não dá pra buscar indicadores automáticos. "
                        "Os dados terão que ser preenchidos manualmente com base no último balanço.")
 
-        site = st.text_input("Site", value=dados_atuais.get("site","") or "")
-        desc = st.text_area("Descrição do negócio", value=dados_atuais.get("descricao_negocio","") or "")
-        futuro = st.text_area("Análise de futuro", value=dados_atuais.get("analise_futuro","") or "")
-
-        st.markdown("**Rating**")
-        cr1,cr2,cr3,cr4 = st.columns(4)
-        rating = cr1.text_input("Rating", value=dados_atuais.get("rating","") or "")
-        rating_agencia = cr2.selectbox("Agência", ["","Fitch","Moody's","S&P","Outra"],
-            index=(["","Fitch","Moody's","S&P","Outra"].index(dados_atuais.get("rating_agencia",""))
-                   if dados_atuais.get("rating_agencia","") in ["","Fitch","Moody's","S&P","Outra"] else 0))
-        rating_persp = cr3.selectbox("Perspectiva", ["","Positiva","Estável","Negativa"],
-            index=(["","Positiva","Estável","Negativa"].index(dados_atuais.get("rating_perspectiva",""))
-                   if dados_atuais.get("rating_perspectiva","") in ["","Positiva","Estável","Negativa"] else 0))
-        preco_alvo = cr4.number_input("Preço alvo (analistas)", min_value=0.0, step=0.01,
-                                       value=float(dados_atuais.get("preco_alvo_analistas") or 0.0))
+        site = st.text_input("Site (opcional)", value=dados_atuais.get("site","") or "")
+        desc = st.text_area("Descrição do negócio (opcional)", value=dados_atuais.get("descricao_negocio","") or "")
+        futuro = st.text_area("Análise de futuro (opcional)", value=dados_atuais.get("analise_futuro","") or "")
 
         eh_banco = st.checkbox("É um banco (habilita Índice de Basileia e Carteira de Crédito)",
                                 value=dados_atuais.get("eh_banco", False))
         indice_basileia = carteira_credito = fator_risco = link_info_banco = None
         if eh_banco:
             cb1,cb2 = st.columns(2)
-            indice_basileia = cb1.number_input("Índice de Basileia (%)", min_value=0.0, step=0.01,
+            indice_basileia = cb1.number_input("Índice de Basileia (%) (opcional)", min_value=0.0, step=0.01,
                 value=float(banco_atual.get("indice_basileia") or 0.0))
-            carteira_credito = cb2.number_input("Carteira de Crédito (R$)", min_value=0.0, step=1000.0,
+            carteira_credito = cb2.number_input("Carteira de Crédito (R$) (opcional)", min_value=0.0, step=1000.0,
                 value=float(banco_atual.get("carteira_credito") or 0.0))
-            fator_risco = st.text_input("Fator de risco", value=banco_atual.get("fator_risco","") or "")
-            link_info_banco = st.text_input("Link com informações do banco (BCB, RI etc.)",
+            fator_risco = st.text_input("Fator de risco (opcional)", value=banco_atual.get("fator_risco","") or "")
+            link_info_banco = st.text_input("Link com informações do banco (BCB, RI etc.) (opcional)",
                 value=banco_atual.get("link_informacoes","") or "")
 
-        if st.form_submit_button("Salvar empresa") and ticker and razao:
-            setor_id = next((s["id"] for s in setores if s["nome"]==setor_nome), None)
-            payload = {
-                "ticker": ticker.upper(), "cnpj": cnpj, "razao_social": razao,
-                "setor_id": setor_id, "tipo_mercado_codigo": tipo_m, "situacao_codigo": sit,
-                "site": site, "descricao_negocio": desc, "analise_futuro": futuro,
-                "segmento": segmento, "na_bolsa": na_bolsa, "eh_banco": eh_banco,
-                "rating": rating, "rating_agencia": rating_agencia, "rating_perspectiva": rating_persp,
-                "preco_alvo_analistas": preco_alvo,
-            }
-            ta_id = next((t["id"] for t in tipos_ativo if t["nome"] == tipo_ativo_nome), None)
-            if ta_id:
-                payload["tipo_ativo_id"] = ta_id
+        st.caption("* Campos obrigatórios")
+        enviado = st.form_submit_button("💾 Salvar empresa")
 
-            r_emp = sb_upsert("empresas", payload)
-            eid_salvo = empresa_id_edicao
-            if not eid_salvo:
-                achado = sb_select("empresas","id",filtros={"ticker":ticker.upper()})
-                eid_salvo = achado[0]["id"] if achado else None
+        if enviado:
+            faltando = []
+            if not ticker_principal.strip():
+                faltando.append("Ticker principal")
+            if not razao.strip():
+                faltando.append("Razão social")
+            if faltando:
+                st.error(f"❌ Não foi possível salvar — preencha: {', '.join(faltando)}.")
+            else:
+                setor_id = next((s["id"] for s in setores if s["nome"]==setor_nome), None)
+                payload = {
+                    "ticker": ticker_principal.strip().upper(), "cnpj": cnpj, "razao_social": razao,
+                    "setor_id": setor_id, "tipo_mercado_codigo": tipo_m or None, "situacao_codigo": sit or None,
+                    "site": site, "descricao_negocio": desc, "analise_futuro": futuro,
+                    "segmento": segmento, "na_bolsa": na_bolsa, "eh_banco": eh_banco,
+                }
+                if empresa_id_edicao:
+                    payload["id"] = empresa_id_edicao
+                ta_id = next((t["id"] for t in tipos_ativo if t["nome"] == tipo_ativo_nome), None)
+                if ta_id:
+                    payload["tipo_ativo_id"] = ta_id
 
-            if eh_banco and eid_salvo:
+                r_emp = sb_upsert("empresas", payload)
+                eid_salvo = empresa_id_edicao
+                if not eid_salvo:
+                    achado = sb_select("empresas","id",filtros={"ticker":ticker_principal.strip().upper()})
+                    eid_salvo = achado[0]["id"] if achado else None
+
+                # garante que o ticker principal também exista na lista de ativos
+                if eid_salvo:
+                    ja_existe_tk = sb_select("ativos_empresa","id",filtros={"empresa_id":eid_salvo,"codigo":ticker_principal.strip().upper()})
+                    if not ja_existe_tk:
+                        sb_upsert("ativos_empresa", {"empresa_id": eid_salvo, "codigo": ticker_principal.strip().upper(),
+                                                      "tipo_ativo_id": ta_id, "ativo": True})
+
+                if eh_banco and eid_salvo:
+                    try:
+                        sb_upsert("bancos_dados", {
+                            "empresa_id": eid_salvo, "cnpj": cnpj,
+                            "indice_basileia": indice_basileia, "carteira_credito": carteira_credito,
+                            "fator_risco": fator_risco, "link_informacoes": link_info_banco,
+                            "data_referencia": str(date.today()), "fonte": "Manual",
+                        })
+                    except Exception as e:
+                        st.warning(f"Empresa salva, mas houve um erro ao salvar dados de banco: {e}")
+
+                st.success(f"✅ Empresa {ticker_principal.strip().upper()} salva."); st.rerun()
+
+    # ---- Rating: busca (links de conferência) + edição manual — só em modo edição ----
+    if empresa_id_edicao:
+        st.markdown("---")
+        st.subheader("Rating")
+        atual_rating = dados_atuais.get("rating") or "—"
+        st.write(f"Rating atual: **{atual_rating}** "
+                 f"({dados_atuais.get('rating_agencia') or '—'}, perspectiva {dados_atuais.get('rating_perspectiva') or '—'})")
+        if st.button("🔎 Buscar Rating"):
+            st.info("Não existe uma fonte pública gratuita e estável para buscar rating de crédito 100% "
+                    "automaticamente. Aqui estão links diretos de busca em cada agência para conferir rápido:")
+            links = buscar_rating_links(dados_atuais.get("razao_social",""))
+            for nome, url in links.items():
+                st.markdown(f"- [{nome}]({url})")
+        with st.form("form_rating_manual"):
+            rm1, rm2, rm3, rm4 = st.columns(4)
+            novo_rating = rm1.text_input("Rating (opcional)", value=dados_atuais.get("rating","") or "")
+            nova_agencia = rm2.selectbox("Agência (opcional)", ["","Fitch","Moody's","S&P","Outra"],
+                index=(["","Fitch","Moody's","S&P","Outra"].index(dados_atuais.get("rating_agencia",""))
+                       if dados_atuais.get("rating_agencia","") in ["","Fitch","Moody's","S&P","Outra"] else 0))
+            nova_persp = rm3.selectbox("Perspectiva (opcional)", ["","Positiva","Estável","Negativa"],
+                index=(["","Positiva","Estável","Negativa"].index(dados_atuais.get("rating_perspectiva",""))
+                       if dados_atuais.get("rating_perspectiva","") in ["","Positiva","Estável","Negativa"] else 0))
+            novo_preco_alvo = rm4.number_input("Preço alvo analistas (opcional)", min_value=0.0, step=0.01,
+                                                value=float(dados_atuais.get("preco_alvo_analistas") or 0.0))
+            if st.form_submit_button("💾 Salvar rating"):
+                sb_upsert("empresas", {"id": empresa_id_edicao, "rating": novo_rating,
+                                       "rating_agencia": nova_agencia, "rating_perspectiva": nova_persp,
+                                       "preco_alvo_analistas": novo_preco_alvo})
+                st.success("Rating atualizado."); st.rerun()
+
+    # ---- Botões extras — só aparecem em modo edição ----
+    if empresa_id_edicao:
+        st.markdown("---")
+        st.subheader("Mais sobre esta empresa")
+        bt1, bt2, bt3, bt4, bt5 = st.columns(5)
+        if bt1.button("📊 Indicadores"): st.session_state["emp_secao_ativa"] = "indicadores"
+        if bt2.button("⭐ Análise de Boa Empresa"): st.session_state["emp_secao_ativa"] = "diagnostico"
+        if bt3.button("📈 Histórico de Lucros"): st.session_state["emp_secao_ativa"] = "historico"
+        if bt4.button("📰 Notícias Relevantes"): st.session_state["emp_secao_ativa"] = "noticias"
+        if bt5.button("🔮 Futuro da Empresa"): st.session_state["emp_secao_ativa"] = "futuro"
+
+        secao = st.session_state.get("emp_secao_ativa")
+
+        if secao == "indicadores":
+            st.markdown("#### 📊 Indicadores (Buffett / Value Investing)")
+            inds_calc = sb_select("indicadores_calculados","*",filtros={"empresa_id":empresa_id_edicao})
+            inds_def = sb_select("indicadores_definicao","id,nome")
+            if inds_calc:
+                df_ic = pd.DataFrame(inds_calc)
+                df_ic["indicador"] = df_ic["indicador_id"].apply(
+                    lambda iid: next((i["nome"] for i in inds_def if i["id"]==iid), f"#{iid}"))
+                cols_show = [c for c in ["indicador","valor","data_referencia","fonte","atualizado_em"] if c in df_ic.columns]
+                st.dataframe(df_ic[cols_show], use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nenhum indicador calculado ainda para esta empresa.")
+            if st.button("🔄 Atualizar (buscar balanço mais recente e recalcular)"):
                 try:
-                    sb_upsert("bancos_dados", {
-                        "empresa_id": eid_salvo,
-                        "cnpj": cnpj,
-                        "indice_basileia": indice_basileia,
-                        "carteira_credito": carteira_credito,
-                        "fator_risco": fator_risco,
-                        "link_informacoes": link_info_banco,
-                        "data_referencia": str(date.today()),
-                        "fonte": "Manual",
-                    })
+                    dados_bal = calc.buscar_balanco_yfinance(dados_atuais["ticker"])
+                    if dados_bal.get("data_referencia"):
+                        dados_bal["empresa_id"] = empresa_id_edicao
+                        sb_upsert("balancos_dre", {k:v for k,v in dados_bal.items() if v is not None})
+                        ind_novo = calc.calcular_indicadores(dados_bal)
+                        for nome, valor in ind_novo.items():
+                            match = next((x for x in inds_def if x["nome"]==nome), None)
+                            if match and valor is not None:
+                                sb_upsert("indicadores_calculados", {
+                                    "empresa_id": empresa_id_edicao, "data_referencia": dados_bal["data_referencia"],
+                                    "indicador_id": match["id"], "valor": valor,
+                                    "fonte": "Yahoo Finance", "atualizado_em": pd.Timestamp.now().isoformat(),
+                                })
+                        st.success(f"Indicadores atualizados com dados de {dados_bal['data_referencia']} (fonte: Yahoo Finance).")
+                        st.rerun()
+                    else:
+                        st.warning("Não encontrou dados de balanço recentes para este ticker.")
                 except Exception as e:
-                    st.warning(f"Empresa salva, mas houve um erro ao salvar dados de banco: {e}")
+                    st.error(f"Erro ao atualizar: {e}")
 
-            st.success(f"Empresa {ticker.upper()} salva."); st.rerun()
+        elif secao == "diagnostico":
+            st.markdown("#### ⭐ Análise de Boa Empresa — diagnóstico")
+            renderizar_diagnostico_boa_empresa(empresa_id_edicao, dados_atuais)
+
+        elif secao == "historico":
+            st.markdown("#### 📈 Histórico de Lucros")
+            hist = sb_select("historico_resultados","*",filtros={"empresa_id":empresa_id_edicao},ordem="ano")
+            if hist:
+                st.dataframe(pd.DataFrame(hist)[["ano","lucro_liquido","teve_prejuizo"]], use_container_width=True, hide_index=True)
+            else:
+                bals_h = sb_select("balancos_dre","data_referencia,net_income",filtros={"empresa_id":empresa_id_edicao})
+                if bals_h:
+                    st.caption("Sem histórico dedicado ainda — mostrando o que existe nos balanços lançados:")
+                    st.dataframe(pd.DataFrame(bals_h), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("Nenhum histórico de lucro cadastrado ainda.")
+            with st.form("form_hist_lucro"):
+                hc1, hc2, hc3 = st.columns([1,1,1])
+                ano_h = hc1.number_input("Ano", min_value=1990, max_value=2100, value=date.today().year-1, step=1)
+                lucro_h = hc2.number_input("Lucro líquido (negativo = prejuízo)", step=1000.0)
+                if hc3.form_submit_button("➕ Adicionar"):
+                    sb_upsert("historico_resultados", {"empresa_id": empresa_id_edicao, "ano": int(ano_h),
+                                                        "lucro_liquido": lucro_h, "fonte": "Manual"})
+                    st.success("Registro adicionado."); st.rerun()
+
+        elif secao == "noticias":
+            st.markdown("#### 📰 Notícias Relevantes")
+            st.caption("Não são armazenadas — sempre buscadas na hora. Cobrem: resultados (lucro/prejuízo), "
+                       "dividendos, novos negócios, expansão, posição no Ibovespa, aumento de preços, "
+                       "problemas judiciais, recuperação judicial, recompra de títulos, parcerias, venda de "
+                       "ativos, indicadores fora do padrão, inovação, aquisição, mudança societária, expansão "
+                       "nos EUA, acordos, investigações, projeções e impacto de decisões políticas — dos "
+                       "últimos ~2 meses.")
+            import urllib.parse as _up
+            termo = _up.quote(f"{dados_atuais.get('razao_social','')} notícias")
+            st.markdown(f"🔗 [Buscar notícias recentes no Google News](https://news.google.com/search?q={termo}&hl=pt-BR&gl=BR)")
+            st.info("Dica: peça no chat 'notícias relevantes sobre [empresa]' para eu pesquisar e resumir "
+                    "direto na conversa — o app publicado sozinho não tem acesso a busca de notícias em tempo real.")
+
+        elif secao == "futuro":
+            st.markdown("#### 🔮 Futuro da Empresa")
+            st.caption("Também não é armazenado separadamente — cobre notícias do segmento, perspectiva do "
+                       "país que afetam o setor, governança da empresa e novos negócios.")
+            if dados_atuais.get("analise_futuro"):
+                st.write(dados_atuais["analise_futuro"])
+            else:
+                st.caption("Nenhuma análise de futuro escrita ainda — preencha o campo 'Análise de futuro' no formulário acima.")
+            import urllib.parse as _up2
+            termo2 = _up2.quote(f"{dados_atuais.get('razao_social','')} perspectivas futuro setor governança")
+            st.markdown(f"🔗 [Buscar perspectivas futuras no Google News](https://news.google.com/search?q={termo2}&hl=pt-BR&gl=BR)")
 
 # ================================================================
 elif pagina == "4. Critérios e Índice de Qualidade":
@@ -1463,10 +1673,25 @@ elif pagina == "9. Índices Macroeconômicos":
 # ================================================================
 elif pagina == "10. Tabelas de Apoio":
     st.header("Tabelas de Apoio")
-    st.subheader("Tipo de Mercado")
+    st.subheader("Setores")
+    df_set_apoio = pd.DataFrame(sb_select("setores","id,nome",ordem="nome"))
+    if not df_set_apoio.empty:
+        st.dataframe(df_set_apoio, use_container_width=True, hide_index=True)
+    with st.form("form_setor_apoio"):
+        ns_apoio = st.text_input("Novo setor")
+        if st.form_submit_button("➕ Adicionar"):
+            if not ns_apoio.strip():
+                st.error("❌ Digite o nome do setor.")
+            else:
+                sb_insert("setores",{"nome":ns_apoio.strip()})
+                st.success(f"Setor '{ns_apoio.strip()}' adicionado."); st.rerun()
+    st.markdown("---")
+    st.subheader("Tipo de Mercado (Segmento de listagem B3)")
     st.dataframe(pd.DataFrame(sb_select("tipo_mercado")), use_container_width=True)
     st.subheader("Situação da Empresa")
     st.dataframe(pd.DataFrame(sb_select("situacao_empresa")), use_container_width=True)
+    st.subheader("Tipos de Ativo")
+    st.dataframe(pd.DataFrame(sb_select("tipos_ativo","id,nome,descricao",ordem="nome")), use_container_width=True)
     st.subheader("Indicadores")
     st.dataframe(pd.DataFrame(sb_select("indicadores_definicao","codigo,nome,categoria,tipo_calculo,grandeza,valor_referencia,formula",ordem="categoria")), use_container_width=True)
     st.markdown("---")
