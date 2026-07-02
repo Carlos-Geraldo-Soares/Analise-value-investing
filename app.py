@@ -1,11 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v1.8
-GERADO EM: 2026-07-02 18:17 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Corrigido bug crítico no Screening (P/L, P/VP, Div.Yield e
-EV/EBITDA zerados por correspondência de coluna errada) + busca avançada por
-CNPJ/Razão Social.
+VERSÃO DESTE ARQUIVO: v2.1
+GERADO EM: 2026-07-02 22:08 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Screening reorganizado — filtro básico compacto + filtro
+avançado com todos os indicadores (E, não OU) + CNPJ/Razão Social/Setor/
+Segmento cruzados com o próprio banco.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -75,6 +75,40 @@ HISTÓRICO:
   busca avançada por CNPJ/Razão Social na tela de Screening (dentro das
   empresas já cadastradas, complementando o filtro por indicadores que
   varre a B3 inteira).
+- v1.9 (2026-07-02): O Screening (resultado.php) nunca teve CNPJ/razão
+  social — confirmado que o Fundamentus só tem essas informações na página
+  de detalhe de CADA papel, não na lista completa. Cadastro automático (ao
+  clicar "Guardar seleção") agora chama buscar_perfil_empresa_fundamentus()
+  pra pegar razão social/setor de verdade (cria o setor sozinho se ele ainda
+  não existir), e buscar_cnpj_brapi() tenta o CNPJ via BrAPI (gratuita) —
+  isso é best-effort: pode não vir pra toda ação, e nesse caso fica em
+  branco pra completar manualmente na tela de Empresas. Atenção: a parte do
+  BrAPI não pôde ser testada ao vivo neste ambiente (rede restrita), então
+  vale conferir na prática se costuma retornar o CNPJ.
+- v2.0 (2026-07-02): Descoberto que o valor estranho no ticker da B3
+  (BRB3SAACNOR6) era na verdade o Código ISIN, colado no campo errado.
+  Pesquisei e confirmei uma fonte oficial pra CNPJ: o cadastro público da
+  CVM (dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv),
+  atualizado diariamente. Criada buscar_cnpj_cvm() com correspondência de
+  nome (remove sufixo de classe de ação tipo "ON"/"PN" e busca por nome que
+  COMECE com o que sobrou — testado e confirmado que "B3 ON" encontra
+  "B3 S.A. - BRASIL, BOLSA, BALCÃO" corretamente), com BrAPI como reserva
+  se a CVM não achar. Agora é a fonte principal de CNPJ tanto no cadastro
+  automático do Screening quanto num novo botão "🔎 Buscar CNPJ" na tela de
+  Empresas (aparece quando a empresa editada ainda não tem CNPJ salvo) —
+  não raspamos o Google diretamente porque ele bloqueia isso.
+- v2.1 (2026-07-02): Tela de Screening reorganizada por pedido do usuário:
+  "Filtro básico" compacto (P/L, ROE, Div.Yield sempre visíveis) + expander
+  "Filtro avançado" com os outros 9 indicadores em grade de 3 colunas
+  (em vez de 1 por linha) — ocupa muito menos espaço vertical. Confirmado
+  (e documentado explicitamente na tela) que a combinação de filtros
+  SEMPRE foi por E, nunca por OU — mais filtros ativos = resultado menor,
+  como esperado. Removida a caixa de busca separada; CNPJ/Razão Social/
+  Setor/Segmento agora são filtros de verdade dentro do mesmo Screening,
+  cruzando a lista do Fundamentus com as empresas já cadastradas no banco
+  (testado: ticker já cadastrado traz razão social/CNPJ/segmento reais,
+  ticker não cadastrado fica em branco — não é bug, é limite da fonte).
+  Tabela de resultado agora mostra mais linhas de uma vez (altura 500px).
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -246,6 +280,138 @@ def _buscar_fundamentus_bruto():
 
     resultado.reset_index(drop=True, inplace=True)
     return resultado, colunas_ausentes
+
+
+def buscar_perfil_empresa_fundamentus(ticker):
+    """
+    Busca razão social aproximada e setor/subsetor na página de detalhes do
+    Fundamentus — usado no cadastro automático quando uma ação é selecionada
+    no Screening (a lista completa do Fundamentus não traz razão social).
+    Nunca estoura erro; devolve {} se não achar nada.
+    """
+    try:
+        url = f"https://www.fundamentus.com.br/detalhes.php?papel={ticker.upper()}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept-Language": "pt-BR,pt;q=0.9",
+        }
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.encoding = "iso-8859-1"
+        tabelas = pd.read_html(io.StringIO(resp.text), decimal=",", thousands=".")
+        pares = {}
+        for t in tabelas:
+            n_cols = t.shape[1]
+            if n_cols < 2 or n_cols % 2 != 0:
+                continue
+            for _, row in t.iterrows():
+                for i in range(0, n_cols, 2):
+                    chave = _normalizar_nome_coluna(str(row.iloc[i]))
+                    valor = row.iloc[i + 1]
+                    if chave and chave not in pares:
+                        pares[chave] = valor
+        return {
+            "razao_social": (str(pares.get("empresa") or "").strip() or None),
+            "setor": (str(pares.get("setor") or "").strip() or None),
+            "subsetor": (str(pares.get("subsetor") or "").strip() or None),
+        }
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _baixar_cadastro_cvm():
+    """
+    Baixa o cadastro oficial da CVM com CNPJ de TODAS as companhias abertas
+    do Brasil (fonte pública, gratuita e estável — muito melhor que tentar
+    adivinhar via scraping do Google, que a própria plataforma bloqueia).
+    Fica em cache por 24h pra não baixar esse arquivo (que é grande) toda
+    vez que alguém cadastra uma empresa.
+    """
+    url = "http://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv"
+    resp = requests.get(url, timeout=30)
+    resp.encoding = "latin-1"
+    df = pd.read_csv(io.StringIO(resp.text), sep=";", encoding="latin-1", dtype=str, on_bad_lines="skip")
+    df.columns = [_normalizar_nome_coluna(c) for c in df.columns]
+    return df
+
+
+_SUFIXOS_CLASSE_ACAO = [" ON N1", " ON N2", " ON NM", " PN N1", " PN N2", " PN NM",
+                         " ON", " PN", " PNA", " PNB", " PNC", " UNT", " UNIT"]
+
+
+def _limpar_nome_para_busca(nome):
+    """Remove sufixos de classe de ação (ON/PN/UNT etc.) que o Fundamentus
+    põe no final do nome, pra sobrar só o nome de fato da empresa."""
+    n = nome.strip().upper()
+    for suf in sorted(_SUFIXOS_CLASSE_ACAO, key=len, reverse=True):
+        if n.endswith(suf):
+            return n[: -len(suf)].strip()
+    return n
+
+
+def buscar_cnpj_cvm(razao_social_aproximada):
+    """
+    Busca o CNPJ no cadastro oficial da CVM por aproximação de nome — a
+    razão social que vem do Fundamentus (ex: "B3 ON") quase nunca bate
+    100% com o nome oficial da CVM (ex: "B3 S.A. - BRASIL, BOLSA, BALCÃO").
+    Estratégia: 1) remove o sufixo de classe de ação (ON/PN/UNT) e tenta
+    achar um nome da CVM que COMECE com o que sobrou (muito mais confiável
+    pra nomes curtos do que similaridade de texto); 2) se não achar, cai
+    pra comparação de similaridade como reserva.
+    Nunca estoura erro. Retorna (cnpj, nome_oficial_cvm) ou (None, None).
+    """
+    if not razao_social_aproximada:
+        return None, None
+    try:
+        df = _baixar_cadastro_cvm()
+        col_cnpj = next((c for c in df.columns if "cnpj" in c), None)
+        col_nome = next((c for c in df.columns if c == "denom_social"), None) \
+            or next((c for c in df.columns if "denom" in c), None)
+        if not col_cnpj or not col_nome:
+            return None, None
+
+        alvo = _limpar_nome_para_busca(razao_social_aproximada)
+        nomes_upper = df[col_nome].astype(str).str.upper()
+
+        if len(alvo) >= 3:
+            match_idx = nomes_upper[nomes_upper.str.startswith(alvo)].index
+            if len(match_idx) > 0:
+                linha = df.loc[match_idx[0]]
+                return str(linha[col_cnpj]).strip(), str(linha[col_nome])
+
+        import difflib
+        melhores = difflib.get_close_matches(alvo, nomes_upper.tolist(), n=1, cutoff=0.5)
+        if not melhores:
+            return None, None
+        linha = df[nomes_upper == melhores[0]].iloc[0]
+        return str(linha[col_cnpj]).strip(), str(linha[col_nome])
+    except Exception:
+        return None, None
+
+
+def buscar_cnpj_brapi(ticker):
+    """
+    Tenta buscar o CNPJ via BrAPI (brapi.dev), API gratuita de dados da B3.
+    Isso é BEST-EFFORT: a BrAPI nem sempre tem esse campo preenchido pra
+    toda ação, e o formato pode mudar sem aviso — por isso nunca estoura
+    erro, só devolve None quando não consegue (o cadastro segue sem CNPJ,
+    pra completar manualmente depois).
+    """
+    try:
+        url = f"https://brapi.dev/api/quote/{ticker.upper()}?modules=summaryProfile"
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        resultados = data.get("results") or []
+        if not resultados:
+            return None
+        perfil = resultados[0].get("summaryProfile") or {}
+        cnpj = perfil.get("cnpj") or resultados[0].get("cnpj")
+        return str(cnpj).strip() if cnpj else None
+    except Exception:
+        return None
 
 
 def _buscar_fundamentus_detalhes(ticker):
@@ -795,35 +961,10 @@ def minhas_carteiras():
 # ================================================================
 if pagina == "0. Screening de Ações":
     st.header("Screening — Seleção de Ações da B3")
-    st.caption("Busca **todas as ações da B3** no Fundamentus em tempo real e aplica seus filtros. "
-               "As ações selecionadas entram na lista de análise — só aí você decide quais cadastrar "
-               "no banco para análise completa (balanço, valor intrínseco etc.).")
-
-    with st.expander("🔎 Busca avançada — encontrar uma empresa já cadastrada por CNPJ ou Razão Social"):
-        st.caption("Isso busca dentro das empresas que você já cadastrou no seu banco — não na B3 inteira. "
-                   "Use o filtro por indicadores abaixo para descobrir ações novas na B3.")
-        termo_busca_emp = st.text_input("Digite parte do CNPJ ou da Razão Social", key="busca_avancada_termo")
-        if termo_busca_emp.strip():
-            todas_emp = sb_select("empresas", "id,ticker,cnpj,razao_social")
-            df_todas_emp = pd.DataFrame(todas_emp) if todas_emp else pd.DataFrame()
-            if df_todas_emp.empty:
-                st.info("Nenhuma empresa cadastrada ainda.")
-            else:
-                termo_norm = termo_busca_emp.strip().lower()
-                cnpj_norm = re.sub(r"[^0-9]", "", termo_busca_emp)
-                mask_busca = df_todas_emp["razao_social"].astype(str).str.lower().str.contains(termo_norm, na=False)
-                if cnpj_norm:
-                    mask_busca |= df_todas_emp["cnpj"].astype(str).str.replace(r"[^0-9]", "", regex=True).str.contains(cnpj_norm, na=False)
-                resultado_busca_emp = df_todas_emp[mask_busca]
-                if resultado_busca_emp.empty:
-                    st.warning("Nenhuma empresa cadastrada corresponde a essa busca.")
-                else:
-                    st.dataframe(resultado_busca_emp[["ticker","razao_social","cnpj"]], use_container_width=True, hide_index=True)
-                    st.caption("Para editar uma dessas empresas, vá em '1. Empresas e Setores' e selecione ela no menu.")
-
-    # ── Configuração dos filtros ──────────────────────────────────
-    st.subheader("Configure os filtros")
-    st.caption("Defina o sinal (≤ menor ou igual, ≥ maior ou igual, = igual) e o valor limite de cada indicador.")
+    st.caption("Busca **todas as ações da B3** no Fundamentus em tempo real e aplica seus filtros — "
+               "todo critério ativo é combinado com **E** (a ação precisa passar em todos ao mesmo "
+               "tempo, não em qualquer um). CNPJ/Razão Social/Setor/Segmento só existem para empresas "
+               "que você já cadastrou (o Fundamentus não traz isso na lista completa).")
 
     INDICADORES_SCREEN = [
         ("P/L",         "pl",    "≤", 15.0,  True),
@@ -840,36 +981,56 @@ if pagina == "0. Screening de Ações":
         ("Liquidez (Vol.)", "liq2meses", "≥", 1000000.0, False),
     ]
 
-    # Inicializar estado dos filtros
     if "filtros_screen" not in st.session_state:
         st.session_state["filtros_screen"] = {
             ind[1]: {"sinal": ind[2], "valor": ind[3], "ativo": ind[4]}
             for ind in INDICADORES_SCREEN
         }
+    if "filtros_texto_screen" not in st.session_state:
+        st.session_state["filtros_texto_screen"] = {"cnpj": "", "razao_social": "", "setor": "Todos", "segmento": ""}
 
     SINAIS = ["≤", "≥", "="]
-    cols_head = st.columns([3, 2, 2, 1])
-    cols_head[0].markdown("**Indicador**")
-    cols_head[1].markdown("**Sinal**")
-    cols_head[2].markdown("**Valor limite**")
-    cols_head[3].markdown("**Ativo**")
 
-    for nome, chave, sinal_def, val_def, ativo_def in INDICADORES_SCREEN:
+    def _widget_indicador(nome, chave):
         estado = st.session_state["filtros_screen"][chave]
-        c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
-        c1.write(nome)
-        novo_sinal = c2.selectbox(" ", SINAIS,
-                                   index=SINAIS.index(estado["sinal"]),
-                                   key=f"sinal_{chave}", label_visibility="collapsed")
-        novo_val = c3.number_input(" ", value=float(estado["valor"]),
-                                    key=f"val_{chave}", label_visibility="collapsed")
-        novo_ativo = c4.checkbox(" ", value=estado["ativo"],
-                                  key=f"ativo_{chave}", label_visibility="collapsed")
-        st.session_state["filtros_screen"][chave] = {
-            "sinal": novo_sinal, "valor": novo_val, "ativo": novo_ativo}
+        ativo = st.checkbox(nome, value=estado["ativo"], key=f"ativo_{chave}")
+        cc1, cc2 = st.columns([1, 2])
+        sinal = cc1.selectbox(" ", SINAIS, index=SINAIS.index(estado["sinal"]),
+                               key=f"sinal_{chave}", label_visibility="collapsed")
+        valor = cc2.number_input(" ", value=float(estado["valor"]),
+                                  key=f"val_{chave}", label_visibility="collapsed")
+        st.session_state["filtros_screen"][chave] = {"sinal": sinal, "valor": valor, "ativo": ativo}
 
-    setor_filtro = st.selectbox("Filtrar por setor (opcional)",
-                                 ["Todos"] + [s["nome"] for s in sb_select("setores","nome",ordem="nome")])
+    # ── Filtro básico: os 3 critérios mais comuns, sempre visíveis ──
+    st.subheader("Filtro básico")
+    b1, b2, b3 = st.columns(3)
+    with b1: _widget_indicador("P/L", "pl")
+    with b2: _widget_indicador("ROE (%)", "roe")
+    with b3: _widget_indicador("Div.Yield(%)", "dy")
+
+    # ── Filtro avançado: todos os demais indicadores + CNPJ/Razão Social/Setor/Segmento ──
+    with st.expander("🔧 Filtro avançado — todos os indicadores + CNPJ, Razão Social, Setor, Segmento"):
+        st.caption("Tudo aqui combina com **E** junto do filtro básico — quanto mais critérios você "
+                   "ativar, menor (mais restrito) tende a ser o resultado.")
+        outros = [i for i in INDICADORES_SCREEN if i[1] not in ("pl", "roe", "dy")]
+        cols_adv = st.columns(3)
+        for idx, (nome, chave, *_resto) in enumerate(outros):
+            with cols_adv[idx % 3]:
+                _widget_indicador(nome, chave)
+
+        st.markdown("---")
+        st.caption("Filtros por atributo da empresa (só funcionam para empresas já cadastradas no seu banco):")
+        setores_disp = ["Todos"] + [s["nome"] for s in sb_select("setores","nome",ordem="nome")]
+        t1, t2 = st.columns(2)
+        cnpj_filtro = t1.text_input("CNPJ contém", value=st.session_state["filtros_texto_screen"]["cnpj"])
+        razao_filtro = t2.text_input("Razão Social contém", value=st.session_state["filtros_texto_screen"]["razao_social"])
+        t3, t4 = st.columns(2)
+        idx_setor = setores_disp.index(st.session_state["filtros_texto_screen"]["setor"]) \
+            if st.session_state["filtros_texto_screen"]["setor"] in setores_disp else 0
+        setor_filtro = t3.selectbox("Setor", setores_disp, index=idx_setor)
+        segmento_filtro = t4.text_input("Segmento contém", value=st.session_state["filtros_texto_screen"]["segmento"])
+        st.session_state["filtros_texto_screen"] = {
+            "cnpj": cnpj_filtro, "razao_social": razao_filtro, "setor": setor_filtro, "segmento": segmento_filtro}
 
     st.markdown("---")
     col_btn1, col_btn2 = st.columns([2, 5])
@@ -886,12 +1047,35 @@ if pagina == "0. Screening de Ações":
                               "ou mudou de layout novamente).")
                     st.info("Tente novamente em alguns minutos.")
                 else:
+                    # enriquece com os dados que JÁ temos cadastrados (razão social, setor,
+                    # segmento, CNPJ) — o Fundamentus não traz isso na lista completa
+                    nossas_empresas = sb_select("empresas", "ticker,cnpj,razao_social,setor_id,segmento") or []
+                    setores_map = {s["id"]: s["nome"] for s in (sb_select("setores","id,nome") or [])}
+                    df_nossas = pd.DataFrame(nossas_empresas)
+                    if not df_nossas.empty:
+                        df_nossas["setor_nome_cadastrado"] = df_nossas["setor_id"].map(setores_map)
+                        df_nossas = df_nossas.rename(columns={"razao_social":"razao_social_cadastrada",
+                                                                "cnpj":"cnpj_cadastrado",
+                                                                "segmento":"segmento_cadastrado"})
+                        df_fund = df_fund.merge(
+                            df_nossas[["ticker","cnpj_cadastrado","razao_social_cadastrada",
+                                       "setor_nome_cadastrado","segmento_cadastrado"]],
+                            on="ticker", how="left")
+                    else:
+                        for c in ["cnpj_cadastrado","razao_social_cadastrada","setor_nome_cadastrado","segmento_cadastrado"]:
+                            df_fund[c] = None
+                    # usa o dado cadastrado quando existir; senão mantém o que o Fundamentus deu (0/vazio)
+                    df_fund["razao_social"] = df_fund["razao_social_cadastrada"].fillna(df_fund.get("razao_social", ""))
+                    df_fund["setor"] = df_fund["setor_nome_cadastrado"].fillna(df_fund.get("setor", ""))
+                    df_fund["cnpj"] = df_fund["cnpj_cadastrado"]
+                    df_fund["segmento"] = df_fund["segmento_cadastrado"]
+
                     if colunas_ausentes:
                         st.warning("⚠️ O Fundamentus não trouxe estes indicadores agora (foram preenchidos com 0): "
                                    + ", ".join(sorted(set(colunas_ausentes))))
 
-                    # aplicar filtros — cada filtro é isolado; um indicador com problema
-                    # não derruba os demais
+                    # aplicar filtros numéricos — tudo combinado com E; um indicador com
+                    # problema não derruba os demais
                     filtros = st.session_state["filtros_screen"]
                     mask = pd.Series([True] * len(df_fund), index=df_fund.index)
                     for chave, cfg in filtros.items():
@@ -910,10 +1094,19 @@ if pagina == "0. Screening de Ações":
                         except Exception:
                             continue  # ignora só esse filtro, não trava a busca inteira
 
-                    df_result = df_fund[mask].copy()
+                    # aplicar filtros de texto/atributo — também combinados com E
+                    ft = st.session_state["filtros_texto_screen"]
+                    if ft["cnpj"].strip():
+                        alvo = re.sub(r"[^0-9]", "", ft["cnpj"])
+                        mask &= df_fund["cnpj"].astype(str).str.replace(r"[^0-9]", "", regex=True).str.contains(alvo, na=False)
+                    if ft["razao_social"].strip():
+                        mask &= df_fund["razao_social"].astype(str).str.lower().str.contains(ft["razao_social"].strip().lower(), na=False)
+                    if ft["setor"] != "Todos":
+                        mask &= df_fund["setor"].astype(str).str.contains(ft["setor"], case=False, na=False)
+                    if ft["segmento"].strip():
+                        mask &= df_fund["segmento"].astype(str).str.lower().str.contains(ft["segmento"].strip().lower(), na=False)
 
-                    if setor_filtro != "Todos" and "setor" in df_result.columns:
-                        df_result = df_result[df_result["setor"].str.contains(setor_filtro, case=False, na=False)]
+                    df_result = df_fund[mask].copy()
 
                     st.session_state["screening_resultado_fund"] = df_result
                     st.session_state["screening_total_fund"] = len(df_fund)
@@ -929,16 +1122,16 @@ if pagina == "0. Screening de Ações":
 
         if df_result.empty:
             st.warning(f"Nenhuma ação passou pelos filtros (de {total} ações consultadas). "
-                       "Tente afrouxar algum critério.")
+                       "Tente afrouxar algum critério (lembre-se: mais filtros ativos = resultado menor).")
         else:
             st.success(f"✅ {len(df_result)} ação(ões) encontrada(s) de {total} consultadas.")
 
             # colunas a exibir
-            cols_exibir = [c for c in ["ticker","razao_social","setor","pl","pvp","roe","roic",
+            cols_exibir = [c for c in ["ticker","razao_social","setor","segmento","cnpj","pl","pvp","roe","roic",
                                          "dy","mrgliq","divpl","evebitda","liqc"] if c in df_result.columns]
             df_show = df_result[cols_exibir].copy()
             df_show.columns = [c.upper() for c in df_show.columns]
-            st.dataframe(df_show, use_container_width=True)
+            st.dataframe(df_show, use_container_width=True, height=500)
 
             st.subheader("Selecione as ações para analisar")
             tickers_disp = df_result["ticker"].tolist() if "ticker" in df_result.columns else []
@@ -949,28 +1142,48 @@ if pagina == "0. Screening de Ações":
             if escolhidas and st.button("💾 Guardar seleção para analisar uma a uma", type="primary"):
                 uid = usuario_id()
                 cadastradas = 0
-                for tk in escolhidas:
-                    # verifica se empresa já existe no banco; se não, cria automaticamente
-                    emps = sb_select("empresas", "id", filtros={"ticker": tk})
-                    if emps:
-                        eid = emps[0]["id"]
-                    else:
-                        # busca dados da empresa no resultado do Fundamentus
-                        row_fund = df_result[df_result["ticker"] == tk]
-                        nome_emp = row_fund["razao_social"].iloc[0] if "razao_social" in row_fund.columns and not row_fund.empty else tk
-                        r_emp = sb_insert("empresas", {"ticker": tk, "razao_social": str(nome_emp), "ativo": True})
-                        eid = r_emp[0]["id"] if r_emp else None
-                        cadastradas += 1
-                    if eid:
-                        sb_upsert("lista_analise", {
-                            "empresa_id": eid, "usuario_id": uid,
-                            "data_selecao": pd.Timestamp.now().isoformat(),
-                            "status": "pendente",
-                            "origem": json.dumps({"fonte": "Fundamentus", "filtros_ativos":
-                                [k for k,v in st.session_state["filtros_screen"].items() if v["ativo"]]})
-                        })
+                setores_existentes = sb_select("setores", "id,nome") or []
+                with st.spinner("Cadastrando empresas novas (buscando razão social, setor e CNPJ)..."):
+                    for tk in escolhidas:
+                        # verifica se empresa já existe no banco; se não, cria automaticamente
+                        emps = sb_select("empresas", "id", filtros={"ticker": tk})
+                        if emps:
+                            eid = emps[0]["id"]
+                        else:
+                            perfil = buscar_perfil_empresa_fundamentus(tk)
+                            nome_emp = perfil.get("razao_social") or tk
+                            setor_id_auto = None
+                            if perfil.get("setor"):
+                                match_s = next((s for s in setores_existentes if s["nome"].lower() == perfil["setor"].lower()), None)
+                                if match_s:
+                                    setor_id_auto = match_s["id"]
+                                else:
+                                    novo_s = sb_insert("setores", {"nome": perfil["setor"]})
+                                    if novo_s:
+                                        setor_id_auto = novo_s[0]["id"]
+                                        setores_existentes.append(novo_s[0])
+                            cnpj_auto, nome_oficial_cvm = buscar_cnpj_cvm(nome_emp)
+                            if not cnpj_auto:
+                                cnpj_auto = buscar_cnpj_brapi(tk)
+                            r_emp = sb_insert("empresas", {
+                                "ticker": tk, "razao_social": str(nome_emp), "ativo": True,
+                                "setor_id": setor_id_auto, "cnpj": cnpj_auto,
+                                "segmento": perfil.get("subsetor"),
+                            })
+                            eid = r_emp[0]["id"] if r_emp else None
+                            cadastradas += 1
+                        if eid:
+                            sb_upsert("lista_analise", {
+                                "empresa_id": eid, "usuario_id": uid,
+                                "data_selecao": pd.Timestamp.now().isoformat(),
+                                "status": "pendente",
+                                "origem": json.dumps({"fonte": "Fundamentus", "filtros_ativos":
+                                    [k for k,v in st.session_state["filtros_screen"].items() if v["ativo"]]})
+                            })
                 if cadastradas:
-                    st.info(f"{cadastradas} empresa(s) nova(s) criada(s) automaticamente no banco.")
+                    st.info(f"{cadastradas} empresa(s) nova(s) criada(s) automaticamente no banco "
+                            "(razão social e setor via Fundamentus; CNPJ via BrAPI quando disponível — "
+                            "confira e complete manualmente se algum campo não veio).")
                 st.success(f"✅ {len(escolhidas)} ação(ões) guardada(s) em 'Minha Lista de Análise'. "
                            "Vá para a Tela 0b para começar a análise.")
 
@@ -1316,6 +1529,28 @@ elif pagina == "1. Empresas e Setores":
                         st.rerun()
     else:
         st.info("Salve a empresa primeiro (com pelo menos um ticker abaixo) para depois adicionar tickers extras.")
+
+    if empresa_id_edicao and not dados_atuais.get("cnpj"):
+        cc1, cc2 = st.columns([1, 3])
+        if cc1.button("🔎 Buscar CNPJ"):
+            with st.spinner("Buscando no cadastro oficial da CVM..."):
+                cnpj_encontrado, nome_cvm = buscar_cnpj_cvm(dados_atuais.get("razao_social", ""))
+                fonte_cnpj = "CVM"
+                if not cnpj_encontrado:
+                    cnpj_encontrado = buscar_cnpj_brapi(dados_atuais.get("ticker", ""))
+                    fonte_cnpj = "BrAPI"
+            if cnpj_encontrado:
+                r_cnpj = gravar_com_confirmacao(sb_update, "empresas", {"cnpj": cnpj_encontrado}, {"id": empresa_id_edicao},
+                    msg_ok=f"✅ CNPJ encontrado via {fonte_cnpj} e salvo: {cnpj_encontrado}"
+                           + (f" (nome oficial: {nome_cvm})" if fonte_cnpj == "CVM" and nome_cvm else ""),
+                    msg_erro="❌ CNPJ encontrado mas não foi possível salvar.")
+                if r_cnpj:
+                    st.rerun()
+            else:
+                st.warning("Não encontrou o CNPJ automaticamente (nem na CVM, nem via BrAPI). "
+                           "Pode digitar manualmente no campo CNPJ abaixo.")
+        cc2.caption("Busca primeiro no cadastro oficial da CVM (por nome aproximado), "
+                    "com BrAPI como reserva.")
 
     st.markdown("---")
     with st.form("form_emp"):
