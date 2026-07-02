@@ -41,6 +41,140 @@ pagina = st.sidebar.radio("Navegação", [
 
 # ---------- HELPERS ----------
 
+import re
+import io
+import unicodedata
+import requests
+
+
+def _normalizar_nome_coluna(c):
+    """snake_case sem acento, sem pontuação, sem underscore duplicado."""
+    c = str(c).strip().lower()
+    c = "".join(x for x in unicodedata.normalize("NFKD", c) if not unicodedata.combining(x))
+    c = re.sub(r"[.\s/]+", "_", c)
+    c = re.sub(r"_+", "_", c).strip("_")
+    return c
+
+
+# cada campo final aceita várias variações possíveis de nome — o Fundamentus
+# muda o cabeçalho de tempos em tempos (foi isso que quebrava a lib antiga)
+_MAPA_FUNDAMENTUS = {
+    "ticker":       ["papel"],
+    "razao_social": ["nome", "empresa"],
+    "setor":        ["setor"],
+    "cotacao":      ["cotacao"],
+    "pl":           ["p_l"],
+    "pvp":          ["p_vp"],
+    "psr":          ["psr"],
+    "dy":           ["div_yield"],
+    "pa":           ["p_ativo"],
+    "pcg":          ["p_cap_giro"],
+    "pebit":        ["p_ebit"],
+    "pacl":         ["p_ativ_circ_liq"],
+    "evebit":       ["ev_ebit"],
+    "evebitda":     ["ev_ebitda"],
+    "mrgebit":      ["mrg_ebit"],
+    "mrgliq":       ["mrg_liq"],
+    "roic":         ["roic"],
+    "roe":          ["roe"],
+    "liqc":         ["liq_corr"],
+    "liq2meses":    ["liq_2meses", "liq2meses"],
+    "patrliq":      ["patrim_liq"],
+    "divpl":        ["div_brut_patrim", "div_bruta_patrim", "div_liq_patrim"],
+    "cagr5":        ["cresc_rec_5a", "cresc_rec5a"],
+}
+
+_CAMPOS_PERCENTUAIS = ["dy", "mrgebit", "mrgliq", "roic", "roe", "cagr5"]
+_CAMPOS_NUMERICOS = ["cotacao", "pl", "pvp", "psr", "pa", "pcg", "pebit", "pacl",
+                      "evebit", "evebitda", "liqc", "liq2meses", "patrliq", "divpl"]
+
+
+def _buscar_fundamentus_bruto():
+    """
+    Busca a tabela completa de ações do Fundamentus (resultado.php) direto por
+    requests + pandas, SEM depender da lib 'fundamentus' do PyPI — ela quebra
+    (KeyError: 'Dív.Brut/ Patrim.') toda vez que o site muda algum cabeçalho,
+    porque tem nomes de coluna fixos no código dela.
+    Aqui cada indicador tem várias variações de nome aceitas e, se nenhuma for
+    encontrada, o campo vira 0 em vez de estourar erro.
+    Retorna: (DataFrame, lista_de_campos_que_nao_foram_encontrados)
+    """
+    url = "https://www.fundamentus.com.br/resultado.php"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+    }
+    resp = requests.get(url, headers=headers, timeout=25)
+    resp.encoding = "iso-8859-1"
+
+    tabelas = pd.read_html(io.StringIO(resp.text), decimal=",", thousands=".")
+    if not tabelas:
+        return None, []
+
+    bruto = tabelas[0]
+    bruto.columns = [_normalizar_nome_coluna(c) for c in bruto.columns]
+
+    resultado = pd.DataFrame(index=bruto.index)
+    colunas_ausentes = []
+
+    for campo_final, variantes in _MAPA_FUNDAMENTUS.items():
+        col_encontrada = next((v for v in variantes if v in bruto.columns), None)
+        if col_encontrada is None:
+            # aproximação: procura uma coluna que contenha as partes do nome esperado
+            partes = [p for p in variantes[0].split("_") if p]
+            col_encontrada = next(
+                (c for c in bruto.columns if all(p in c for p in partes)), None
+            )
+        if col_encontrada is not None:
+            try:
+                resultado[campo_final] = bruto[col_encontrada]
+            except Exception:
+                resultado[campo_final] = 0
+                colunas_ausentes.append(campo_final)
+        else:
+            resultado[campo_final] = 0
+            colunas_ausentes.append(campo_final)
+
+    # campos percentuais às vezes vêm como texto "12,3%"
+    for campo in _CAMPOS_PERCENTUAIS:
+        if campo in resultado.columns:
+            resultado[campo] = (
+                resultado[campo].astype(str)
+                .str.replace("%", "", regex=False)
+                .str.replace(".", "", regex=False)
+                .str.replace(",", ".", regex=False)
+            )
+            resultado[campo] = pd.to_numeric(resultado[campo], errors="coerce").fillna(0)
+
+    for campo in _CAMPOS_NUMERICOS:
+        if campo in resultado.columns:
+            resultado[campo] = pd.to_numeric(resultado[campo], errors="coerce").fillna(0)
+
+    resultado.reset_index(drop=True, inplace=True)
+    return resultado, colunas_ausentes
+
+
+def buscar_cotacao_tempo_real(ticker):
+    """
+    Cotação em tempo real (na prática, ~15 min de atraso — padrão do Yahoo
+    Finance para a B3) via yfinance. Retorna 0.0 se não conseguir; nunca
+    estoura erro pra tela.
+    Uso recomendado: 1 ação por vez (relatório da ação / fluxo guiado). Não
+    usar para a lista inteira da B3 no screening — seria lento e a B3/Yahoo
+    limitam requisições em massa. O screening usa os múltiplos do próprio
+    Fundamentus (P/L, P/VP etc.), que já embutem o preço.
+    """
+    try:
+        import yfinance as yf
+        tk = ticker if ticker.upper().endswith(".SA") else f"{ticker.upper()}.SA"
+        info = yf.Ticker(tk).fast_info
+        preco = info.get("last_price") or info.get("lastPrice") or 0.0
+        return float(preco) if preco else 0.0
+    except Exception:
+        return 0.0
+
+
 def lista_empresas():
     dados = sb_select("empresas", "id,ticker,cnpj,razao_social,setor_id,subsetor_id", ordem="ticker")
     return pd.DataFrame(dados) if dados else pd.DataFrame()
@@ -138,72 +272,44 @@ if pagina == "0. Screening de Ações":
     if buscar:
         with st.spinner("Buscando todas as ações da B3 no Fundamentus... aguarde."):
             try:
-                import fundamentus
-                df_fund = fundamentus.get_resultado()
-                df_fund = df_fund.reset_index()
-                df_fund.columns = [str(c).strip().lower() for c in df_fund.columns]
+                df_fund, colunas_ausentes = _buscar_fundamentus_bruto()
 
-                # mapa de colunas do Fundamentus para nossos nomes
-                # normaliza os nomes das colunas antes de mapear
-                def norm_col(c):
-                    import unicodedata
-                    c = str(c).strip().lower()
-                    c = "".join(x for x in unicodedata.normalize("NFKD",c) if not unicodedata.combining(x))
-                    return c.replace(" ","_").replace("/","_").replace(".","_").replace("__","_")
+                if df_fund is None or df_fund.empty:
+                    st.error("O Fundamentus não retornou dados agora (site fora do ar, bloqueando o acesso "
+                              "ou mudou de layout novamente).")
+                    st.info("Tente novamente em alguns minutos.")
+                else:
+                    if colunas_ausentes:
+                        st.warning("⚠️ O Fundamentus não trouxe estes indicadores agora (foram preenchidos com 0): "
+                                   + ", ".join(sorted(set(colunas_ausentes))))
 
-                df_fund.columns = [norm_col(c) for c in df_fund.columns]
+                    # aplicar filtros — cada filtro é isolado; um indicador com problema
+                    # não derruba os demais
+                    filtros = st.session_state["filtros_screen"]
+                    mask = pd.Series([True] * len(df_fund), index=df_fund.index)
+                    for chave, cfg in filtros.items():
+                        if not cfg["ativo"] or chave not in df_fund.columns:
+                            continue
+                        try:
+                            val = cfg["valor"]
+                            sinal = cfg["sinal"]
+                            col_series = pd.to_numeric(df_fund[chave], errors="coerce").fillna(0)
+                            if sinal == "≤":
+                                mask &= col_series <= val
+                            elif sinal == "≥":
+                                mask &= col_series >= val
+                            elif sinal == "=":
+                                mask &= col_series == val
+                        except Exception:
+                            continue  # ignora só esse filtro, não trava a busca inteira
 
-                # mapa flexível — cobre variações de nome do Fundamentus
-                mapa_cols = {
-                    "papel": "ticker", "nome": "razao_social", "setor": "setor",
-                    "p_l": "pl", "p_vp": "pvp",
-                    "roe": "roe", "roic": "roic",
-                    "div_yield": "dy",
-                    "mrg_liq_": "mrgliq", "mrg__liq_": "mrgliq",
-                    "div_patrim_": "divpl", "div_brut__patrim_": "divpl",
-                    "ev_ebitda": "evebitda", "p_ebitda": "pebitda",
-                    "cresc__rec_5a": "cagr5", "cresc_rec_5a": "cagr5",
-                    "liq__corr_": "liqc", "liq_corr_": "liqc",
-                    "liq_2meses": "liq2meses",
-                    "patrim__liq": "pl_val", "patrim_liq": "pl_val",
-                }
-                df_fund = df_fund.rename(columns={k: v for k, v in mapa_cols.items() if k in df_fund.columns})
+                    df_result = df_fund[mask].copy()
 
-                # converter colunas numéricas
-                for col in ["pl","pvp","roe","roic","dy","mrgliq","divpl","evebitda","pebitda","cagr5","liqc","liq2meses"]:
-                    if col in df_fund.columns:
-                        df_fund[col] = pd.to_numeric(df_fund[col], errors="coerce")
+                    if setor_filtro != "Todos" and "setor" in df_result.columns:
+                        df_result = df_result[df_result["setor"].str.contains(setor_filtro, case=False, na=False)]
 
-                # converter ROE e outros para % se estiverem em decimal
-                for col in ["roe","roic","dy","mrgliq","cagr5"]:
-                    if col in df_fund.columns:
-                        # Fundamentus já retorna em % (ex: 0.15 = 15%)
-                        if df_fund[col].abs().max() < 5:
-                            df_fund[col] = df_fund[col] * 100
-
-                # aplicar filtros
-                filtros = st.session_state["filtros_screen"]
-                mask = pd.Series([True] * len(df_fund), index=df_fund.index)
-                for chave, cfg in filtros.items():
-                    if not cfg["ativo"] or chave not in df_fund.columns:
-                        continue
-                    val = cfg["valor"]
-                    sinal = cfg["sinal"]
-                    col_series = pd.to_numeric(df_fund[chave], errors="coerce")
-                    if sinal == "≤":
-                        mask &= col_series <= val
-                    elif sinal == "≥":
-                        mask &= col_series >= val
-                    elif sinal == "=":
-                        mask &= col_series == val
-
-                df_result = df_fund[mask].copy()
-
-                if setor_filtro != "Todos" and "setor" in df_result.columns:
-                    df_result = df_result[df_result["setor"].str.contains(setor_filtro, case=False, na=False)]
-
-                st.session_state["screening_resultado_fund"] = df_result
-                st.session_state["screening_total_fund"] = len(df_fund)
+                    st.session_state["screening_resultado_fund"] = df_result
+                    st.session_state["screening_total_fund"] = len(df_fund)
 
             except Exception as e:
                 st.error(f"Erro ao buscar dados no Fundamentus: {e}")
@@ -506,27 +612,129 @@ elif pagina == "1. Empresas e Setores":
     with c2:
         st.subheader("Empresas")
         st.dataframe(lista_empresas(), use_container_width=True)
-    st.subheader("Cadastrar nova empresa")
+    st.subheader("Cadastrar ou editar empresa")
+
     setores = sb_select("setores","id,nome",ordem="nome")
     tipos = sb_select("tipo_mercado","codigo",ordem="codigo")
     sits = sb_select("situacao_empresa","codigo",ordem="codigo")
+    tipos_ativo = sb_select("tipos_ativo","id,nome",ordem="nome")
+
+    # ---- escolher empresa existente pra editar (opcional) ----
+    df_emp_edit = lista_empresas()
+    opcoes_edit = ["➕ Nova empresa"] + (
+        list(df_emp_edit["ticker"] + " - " + df_emp_edit["razao_social"]) if not df_emp_edit.empty else []
+    )
+    escolha_edit = st.selectbox("Selecione uma empresa para editar, ou cadastre uma nova", opcoes_edit)
+
+    dados_atuais = {}
+    banco_atual = {}
+    empresa_id_edicao = None
+    if escolha_edit != "➕ Nova empresa":
+        ticker_sel = escolha_edit.split(" - ")[0]
+        registro = sb_select("empresas", "*", filtros={"ticker": ticker_sel})
+        if registro:
+            dados_atuais = registro[0]
+            empresa_id_edicao = dados_atuais.get("id")
+            # resolve nomes a partir dos IDs (a tabela guarda só os IDs)
+            if dados_atuais.get("setor_id"):
+                s_match = next((s for s in setores if s["id"] == dados_atuais["setor_id"]), None)
+                dados_atuais["setor_nome"] = s_match["nome"] if s_match else ""
+            if dados_atuais.get("tipo_ativo_id") and tipos_ativo:
+                t_match = next((t for t in tipos_ativo if t["id"] == dados_atuais["tipo_ativo_id"]), None)
+                dados_atuais["tipo_ativo_nome"] = t_match["nome"] if t_match else "Ação"
+            banco_reg = sb_select("bancos_dados", "*", filtros={"empresa_id": empresa_id_edicao})
+            if banco_reg:
+                banco_atual = banco_reg[0]
+
     with st.form("form_emp"):
         c1,c2,c3 = st.columns(3)
-        ticker = c1.text_input("Ticker")
-        razao = c2.text_input("Razão social")
-        cnpj = c3.text_input("CNPJ")
-        setor_nome = st.selectbox("Setor", [""]+[s["nome"] for s in setores])
-        c4,c5 = st.columns(2)
-        tipo_m = c4.selectbox("Tipo mercado",[t["codigo"] for t in tipos]) if tipos else c4.text_input("Tipo")
-        sit = c5.selectbox("Situação",[s["codigo"] for s in sits]) if sits else c5.text_input("Situação")
-        site = st.text_input("Site")
-        desc = st.text_area("Descrição do negócio")
-        futuro = st.text_area("Análise de futuro")
+        ticker = c1.text_input("Ticker", value=dados_atuais.get("ticker",""))
+        razao = c2.text_input("Razão social", value=dados_atuais.get("razao_social",""))
+        cnpj = c3.text_input("CNPJ", value=dados_atuais.get("cnpj",""))
+
+        c4,c5,c6 = st.columns(3)
+        setor_nomes = [""]+[s["nome"] for s in setores]
+        setor_idx = setor_nomes.index(dados_atuais.get("setor_nome","")) if dados_atuais.get("setor_nome") in setor_nomes else 0
+        setor_nome = c4.selectbox("Setor", setor_nomes, index=setor_idx)
+        segmento = c5.text_input("Segmento", value=dados_atuais.get("segmento","") or "")
+        tipo_ativo_nomes = [t["nome"] for t in tipos_ativo] if tipos_ativo else ["Ação"]
+        ta_idx = tipo_ativo_nomes.index(dados_atuais.get("tipo_ativo_nome","Ação")) if dados_atuais.get("tipo_ativo_nome") in tipo_ativo_nomes else 0
+        tipo_ativo_nome = c6.selectbox("Tipo de ativo", tipo_ativo_nomes, index=ta_idx)
+
+        c7,c8 = st.columns(2)
+        tipo_m = c7.selectbox("Tipo mercado",[t["codigo"] for t in tipos]) if tipos else c7.text_input("Tipo")
+        sit = c8.selectbox("Situação",[s["codigo"] for s in sits]) if sits else c8.text_input("Situação")
+
+        na_bolsa = st.checkbox("Empresa negociada na bolsa (B3)",
+                                value=dados_atuais.get("na_bolsa", True))
+        if not na_bolsa:
+            st.caption("⚠️ Fora da bolsa: não dá pra buscar indicadores automáticos. "
+                       "Os dados terão que ser preenchidos manualmente com base no último balanço.")
+
+        site = st.text_input("Site", value=dados_atuais.get("site","") or "")
+        desc = st.text_area("Descrição do negócio", value=dados_atuais.get("descricao_negocio","") or "")
+        futuro = st.text_area("Análise de futuro", value=dados_atuais.get("analise_futuro","") or "")
+
+        st.markdown("**Rating**")
+        cr1,cr2,cr3,cr4 = st.columns(4)
+        rating = cr1.text_input("Rating", value=dados_atuais.get("rating","") or "")
+        rating_agencia = cr2.selectbox("Agência", ["","Fitch","Moody's","S&P","Outra"],
+            index=(["","Fitch","Moody's","S&P","Outra"].index(dados_atuais.get("rating_agencia",""))
+                   if dados_atuais.get("rating_agencia","") in ["","Fitch","Moody's","S&P","Outra"] else 0))
+        rating_persp = cr3.selectbox("Perspectiva", ["","Positiva","Estável","Negativa"],
+            index=(["","Positiva","Estável","Negativa"].index(dados_atuais.get("rating_perspectiva",""))
+                   if dados_atuais.get("rating_perspectiva","") in ["","Positiva","Estável","Negativa"] else 0))
+        preco_alvo = cr4.number_input("Preço alvo (analistas)", min_value=0.0, step=0.01,
+                                       value=float(dados_atuais.get("preco_alvo_analistas") or 0.0))
+
+        eh_banco = st.checkbox("É um banco (habilita Índice de Basileia e Carteira de Crédito)",
+                                value=dados_atuais.get("eh_banco", False))
+        indice_basileia = carteira_credito = fator_risco = link_info_banco = None
+        if eh_banco:
+            cb1,cb2 = st.columns(2)
+            indice_basileia = cb1.number_input("Índice de Basileia (%)", min_value=0.0, step=0.01,
+                value=float(banco_atual.get("indice_basileia") or 0.0))
+            carteira_credito = cb2.number_input("Carteira de Crédito (R$)", min_value=0.0, step=1000.0,
+                value=float(banco_atual.get("carteira_credito") or 0.0))
+            fator_risco = st.text_input("Fator de risco", value=banco_atual.get("fator_risco","") or "")
+            link_info_banco = st.text_input("Link com informações do banco (BCB, RI etc.)",
+                value=banco_atual.get("link_informacoes","") or "")
+
         if st.form_submit_button("Salvar empresa") and ticker and razao:
             setor_id = next((s["id"] for s in setores if s["nome"]==setor_nome), None)
-            sb_upsert("empresas",{"ticker":ticker.upper(),"cnpj":cnpj,"razao_social":razao,
-                "setor_id":setor_id,"tipo_mercado_codigo":tipo_m,"situacao_codigo":sit,
-                "site":site,"descricao_negocio":desc,"analise_futuro":futuro})
+            payload = {
+                "ticker": ticker.upper(), "cnpj": cnpj, "razao_social": razao,
+                "setor_id": setor_id, "tipo_mercado_codigo": tipo_m, "situacao_codigo": sit,
+                "site": site, "descricao_negocio": desc, "analise_futuro": futuro,
+                "segmento": segmento, "na_bolsa": na_bolsa, "eh_banco": eh_banco,
+                "rating": rating, "rating_agencia": rating_agencia, "rating_perspectiva": rating_persp,
+                "preco_alvo_analistas": preco_alvo,
+            }
+            ta_id = next((t["id"] for t in tipos_ativo if t["nome"] == tipo_ativo_nome), None)
+            if ta_id:
+                payload["tipo_ativo_id"] = ta_id
+
+            r_emp = sb_upsert("empresas", payload)
+            eid_salvo = empresa_id_edicao
+            if not eid_salvo:
+                achado = sb_select("empresas","id",filtros={"ticker":ticker.upper()})
+                eid_salvo = achado[0]["id"] if achado else None
+
+            if eh_banco and eid_salvo:
+                try:
+                    sb_upsert("bancos_dados", {
+                        "empresa_id": eid_salvo,
+                        "cnpj": cnpj,
+                        "indice_basileia": indice_basileia,
+                        "carteira_credito": carteira_credito,
+                        "fator_risco": fator_risco,
+                        "link_informacoes": link_info_banco,
+                        "data_referencia": str(date.today()),
+                        "fonte": "Manual",
+                    })
+                except Exception as e:
+                    st.warning(f"Empresa salva, mas houve um erro ao salvar dados de banco: {e}")
+
             st.success(f"Empresa {ticker.upper()} salva."); st.rerun()
 
 # ================================================================
