@@ -1,10 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v1.7
-GERADO EM: 2026-07-02 17:51 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Cotação automática (equivalente ao GOOGLEFINANCE) conectada
-na tela de Carteira, com data e hora completas.
+VERSÃO DESTE ARQUIVO: v1.8
+GERADO EM: 2026-07-02 18:17 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Corrigido bug crítico no Screening (P/L, P/VP, Div.Yield e
+EV/EBITDA zerados por correspondência de coluna errada) + busca avançada por
+CNPJ/Razão Social.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -62,6 +63,18 @@ HISTÓRICO:
   (antes só gravava a data). O ajuste manual continua disponível como
   reserva/correção, mostrando quando cada preço foi atualizado pela última
   vez.
+- v1.8 (2026-07-02): CAUSA RAIZ CONFIRMADA do bug "P/L, P/VP, Div.Yield e
+  EV/EBITDA sempre zerados no Screening": a correspondência aproximada de
+  colunas do Fundamentus checava se cada LETRA do nome aparecia solta em
+  qualquer lugar da coluna — "P/L" (letras p, l) batia incorretamente com a
+  coluna "papel" (que também tem p e l soltos em qualquer posição), e como
+  "papel" é texto (não número), virava 0 pra todo mundo. Trocado por
+  correspondência de SUBSTRING CONTÍGUA (ex.: "pl" precisa aparecer junto),
+  testado e confirmado que resolve o caso exato do bug. Também ampliada a
+  lista de nomes aceitos pra P/L, P/VP, Div.Yield e EV/EBITDA. Adicionada
+  busca avançada por CNPJ/Razão Social na tela de Screening (dentro das
+  empresas já cadastradas, complementando o filtro por indicadores que
+  varre a B3 inteira).
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -136,16 +149,16 @@ _MAPA_FUNDAMENTUS = {
     "razao_social": ["nome", "empresa"],
     "setor":        ["setor"],
     "cotacao":      ["cotacao"],
-    "pl":           ["p_l"],
-    "pvp":          ["p_vp"],
+    "pl":           ["p_l", "pl"],
+    "pvp":          ["p_vp", "pvp"],
     "psr":          ["psr"],
-    "dy":           ["div_yield"],
+    "dy":           ["div_yield", "dy", "dividend_yield"],
     "pa":           ["p_ativo"],
     "pcg":          ["p_cap_giro"],
     "pebit":        ["p_ebit"],
     "pacl":         ["p_ativ_circ_liq"],
     "evebit":       ["ev_ebit"],
-    "evebitda":     ["ev_ebitda"],
+    "evebitda":     ["ev_ebitda", "evebitda"],
     "mrgebit":      ["mrg_ebit"],
     "mrgliq":       ["mrg_liq"],
     "roic":         ["roic"],
@@ -191,17 +204,24 @@ def _buscar_fundamentus_bruto():
     resultado = pd.DataFrame(index=bruto.index)
     colunas_ausentes = []
 
+    colunas_usadas = set()
     for campo_final, variantes in _MAPA_FUNDAMENTUS.items():
-        col_encontrada = next((v for v in variantes if v in bruto.columns), None)
+        col_encontrada = next((v for v in variantes if v in bruto.columns and v not in colunas_usadas), None)
         if col_encontrada is None:
-            # aproximação: procura uma coluna que contenha as partes do nome esperado
-            partes = [p for p in variantes[0].split("_") if p]
+            # aproximação SEGURA: exige que o nome esperado apareça como
+            # substring CONTÍGUA (ex.: "pl" precisa aparecer junto, não cada
+            # letra solta em qualquer lugar — era isso que fazia "P/L" bater
+            # errado com "papel", zerando o indicador pra todo mundo)
+            alvo = variantes[0].replace("_", "")
             col_encontrada = next(
-                (c for c in bruto.columns if all(p in c for p in partes)), None
+                (c for c in bruto.columns
+                 if c not in colunas_usadas and alvo and alvo in c.replace("_", "")),
+                None
             )
         if col_encontrada is not None:
             try:
                 resultado[campo_final] = bruto[col_encontrada]
+                colunas_usadas.add(col_encontrada)
             except Exception:
                 resultado[campo_final] = 0
                 colunas_ausentes.append(campo_final)
@@ -778,6 +798,28 @@ if pagina == "0. Screening de Ações":
     st.caption("Busca **todas as ações da B3** no Fundamentus em tempo real e aplica seus filtros. "
                "As ações selecionadas entram na lista de análise — só aí você decide quais cadastrar "
                "no banco para análise completa (balanço, valor intrínseco etc.).")
+
+    with st.expander("🔎 Busca avançada — encontrar uma empresa já cadastrada por CNPJ ou Razão Social"):
+        st.caption("Isso busca dentro das empresas que você já cadastrou no seu banco — não na B3 inteira. "
+                   "Use o filtro por indicadores abaixo para descobrir ações novas na B3.")
+        termo_busca_emp = st.text_input("Digite parte do CNPJ ou da Razão Social", key="busca_avancada_termo")
+        if termo_busca_emp.strip():
+            todas_emp = sb_select("empresas", "id,ticker,cnpj,razao_social")
+            df_todas_emp = pd.DataFrame(todas_emp) if todas_emp else pd.DataFrame()
+            if df_todas_emp.empty:
+                st.info("Nenhuma empresa cadastrada ainda.")
+            else:
+                termo_norm = termo_busca_emp.strip().lower()
+                cnpj_norm = re.sub(r"[^0-9]", "", termo_busca_emp)
+                mask_busca = df_todas_emp["razao_social"].astype(str).str.lower().str.contains(termo_norm, na=False)
+                if cnpj_norm:
+                    mask_busca |= df_todas_emp["cnpj"].astype(str).str.replace(r"[^0-9]", "", regex=True).str.contains(cnpj_norm, na=False)
+                resultado_busca_emp = df_todas_emp[mask_busca]
+                if resultado_busca_emp.empty:
+                    st.warning("Nenhuma empresa cadastrada corresponde a essa busca.")
+                else:
+                    st.dataframe(resultado_busca_emp[["ticker","razao_social","cnpj"]], use_container_width=True, hide_index=True)
+                    st.caption("Para editar uma dessas empresas, vá em '1. Empresas e Setores' e selecione ela no menu.")
 
     # ── Configuração dos filtros ──────────────────────────────────
     st.subheader("Configure os filtros")
