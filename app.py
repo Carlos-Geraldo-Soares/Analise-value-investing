@@ -1,9 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v1.2
-GERADO EM: 2026-07-02 04:20 (horário de geração pelo assistente)
-ÚLTIMA MUDANÇA: Tela de Empresas redesenhada.
+VERSÃO DESTE ARQUIVO: v1.3
+GERADO EM: 2026-07-02 05:10 (horário de geração pelo assistente)
+ÚLTIMA MUDANÇA: Correção do bug de Rating não salvando + confirmação real de
+gravação em TODAS as telas.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -21,6 +22,14 @@ HISTÓRICO:
   botões de Indicadores / Análise de Boa Empresa / Histórico de Lucros /
   Notícias Relevantes / Futuro da Empresa agora só aparecem em modo edição
   (empresa já salva), não durante o cadastro de uma nova empresa.
+- v1.3 (2026-07-02): Corrigido bug em que o Rating não gravava no banco (o
+  upsert de uma empresa já existente agora usa UPDATE por id em vez de
+  UPSERT, evitando depender de qual coluna o upsert usa como chave de
+  conflito). Adicionada a função gravar_com_confirmacao(), aplicada em TODOS
+  os pontos de gravação do app (~30 lugares): toda gravação agora mostra
+  "✅ ... salvo com sucesso" SÓ quando o banco realmente confirmou, e
+  "❌ Não foi possível salvar" com o motivo quando falha — nenhuma tela
+  finge sucesso silenciosamente mais.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -500,7 +509,7 @@ def renderizar_diagnostico_boa_empresa(emp_id, emp, permitir_salvar=True):
     with st.expander("Ver detalhamento critério a critério (para validar)"):
         st.json(resultado["detalhes"])
     if permitir_salvar and st.button("💾 Salvar este diagnóstico", key=f"salvar_ibe_{emp_id}"):
-        sb_upsert("indice_boa_empresa", {
+        gravar_com_confirmacao(sb_upsert, "indice_boa_empresa", {
             "empresa_id": emp_id, "data_calculo": date.today().isoformat(),
             "nota_valuation": resultado["nota_valuation"],
             "nota_qualidade_financeira": resultado["nota_qualidade_financeira"],
@@ -509,8 +518,7 @@ def renderizar_diagnostico_boa_empresa(emp_id, emp, permitir_salvar=True):
             "nota_final": resultado["nota_final"],
             "classificacao": resultado["classificacao"],
             "detalhes": resultado["detalhes"],
-        })
-        st.success("Diagnóstico salvo.")
+        }, msg_ok="✅ Diagnóstico salvo com sucesso.", msg_erro="❌ Não foi possível salvar o diagnóstico.")
 
 
 def buscar_rating_links(nome_empresa):
@@ -528,6 +536,30 @@ def buscar_rating_links(nome_empresa):
         "S&P Global": f"https://www.spglobal.com/ratings/en/search-results?query={q}",
         "Busca geral": f"https://www.google.com/search?q={q}+rating+de+cr%C3%A9dito",
     }
+
+
+def gravar_com_confirmacao(func, *args, msg_ok="✅ Atualização com sucesso.",
+                            msg_erro="❌ Não foi possível salvar.", permitir_vazio=False, **kwargs):
+    """
+    Executa uma gravação no banco (sb_insert/sb_upsert/sb_update/sb_delete) e
+    SEMPRE mostra na tela se funcionou ou não — nunca fica em silêncio nem
+    finge sucesso quando o banco não confirmou nada.
+    permitir_vazio=True: use para DELETE, que às vezes retorna lista vazia
+    mesmo quando funcionou — nesse caso só uma exceção real conta como erro.
+    Devolve o resultado pra quem chamou continuar usando (ex: pegar o id
+    gerado), ou None se falhou.
+    """
+    try:
+        resultado = func(*args, **kwargs)
+    except Exception as e:
+        st.error(f"{msg_erro} Detalhe técnico: {e}")
+        return None
+    if not permitir_vazio and (resultado is None or resultado == [] or resultado == {} or resultado is False):
+        st.error(f"{msg_erro} (o banco não confirmou a gravação — confira os campos "
+                 "obrigatórios e as permissões de escrita desta tabela)")
+        return None
+    st.success(msg_ok)
+    return resultado if resultado not in (None, [], {}, False) else True
 
 
 def lista_empresas():
@@ -746,14 +778,15 @@ elif pagina == "0b. Minha Lista de Análise":
         linha = lista[lista["ticker"]==ticker_sel].iloc[0]
         c1,c2,c3 = st.columns(3)
         if c1.button("▶️ Em análise"):
-            sb_update("lista_analise", {"status": "em_analise"}, {"id": int(linha["id"])})
-            st.rerun()
+            if gravar_com_confirmacao(sb_update, "lista_analise", {"status": "em_analise"}, {"id": int(linha["id"])}):
+                st.rerun()
         if c2.button("✅ Analisada"):
-            sb_update("lista_analise", {"status": "analisada"}, {"id": int(linha["id"])})
-            st.rerun()
+            if gravar_com_confirmacao(sb_update, "lista_analise", {"status": "analisada"}, {"id": int(linha["id"])}):
+                st.rerun()
         if c3.button("🗑️ Remover"):
-            sb_delete("lista_analise", {"id": int(linha["id"])})
-            st.rerun()
+            if gravar_com_confirmacao(sb_delete, "lista_analise", {"id": int(linha["id"])},
+                                       msg_ok="✅ Removido com sucesso.", permitir_vazio=True):
+                st.rerun()
         st.markdown("---")
         if st.button(f"🧭 Iniciar Fluxo de Análise guiado para {ticker_sel}", type="primary"):
             sb_update("lista_analise", {"status": "em_analise"}, {"id": int(linha["id"])})
@@ -800,9 +833,12 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                             dados = calc.buscar_balanco_yfinance(emp["ticker"])
                             if dados.get("data_referencia"):
                                 dados["empresa_id"] = emp_id
-                                sb_upsert("balancos_dre", {k:v for k,v in dados.items() if v is not None})
-                                st.success(f"✅ Balanço de {dados['data_referencia']} importado automaticamente!")
-                                st.rerun()
+                                r = gravar_com_confirmacao(sb_upsert, "balancos_dre",
+                                    {k:v for k,v in dados.items() if v is not None},
+                                    msg_ok=f"✅ Balanço de {dados['data_referencia']} importado e salvo com sucesso.",
+                                    msg_erro="❌ Não foi possível salvar o balanço buscado.")
+                                if r:
+                                    st.rerun()
                             else:
                                 st.warning("Dados encontrados mas sem data de referência. Use o lançamento manual.")
                         except Exception as e:
@@ -831,9 +867,10 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                         "fonte": "Lançado manualmente"
                     }
                     if st.form_submit_button("💾 Salvar balanço manual"):
-                        sb_upsert("balancos_dre", dados_bal)
-                        st.success("Balanço salvo.")
-                        st.rerun()
+                        r = gravar_com_confirmacao(sb_upsert, "balancos_dre", dados_bal,
+                            msg_ok="✅ Balanço salvo com sucesso.", msg_erro="❌ Não foi possível salvar o balanço.")
+                        if r:
+                            st.rerun()
 
             elif step == 2:
                 st.write("**Etapa 2 — Indicadores e Valor Intrínseco**")
@@ -856,11 +893,22 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
 
                     if st.button("💾 Gravar indicadores no banco"):
                         inds_def = sb_select("indicadores_definicao","id,nome")
+                        ok_count, falha_count = 0, 0
                         for nome, valor in ind.items():
                             match = next((x for x in inds_def if x["nome"]==nome), None)
                             if match and valor is not None:
-                                sb_upsert("indicadores_calculados",{"empresa_id":emp_id,"data_referencia":data_ref,"indicador_id":match["id"],"valor":valor})
-                        st.success("✅ Indicadores gravados.")
+                                try:
+                                    res = sb_upsert("indicadores_calculados",{"empresa_id":emp_id,"data_referencia":data_ref,"indicador_id":match["id"],"valor":valor})
+                                    ok_count += 1 if res else 0
+                                    falha_count += 0 if res else 1
+                                except Exception:
+                                    falha_count += 1
+                        if falha_count == 0 and ok_count > 0:
+                            st.success(f"✅ {ok_count} indicador(es) gravado(s) com sucesso.")
+                        elif ok_count > 0:
+                            st.warning(f"⚠️ {ok_count} gravado(s), mas {falha_count} falharam.")
+                        else:
+                            st.error("❌ Não foi possível gravar os indicadores.")
 
                     st.markdown("---")
                     st.subheader("Valor Intrínseco")
@@ -893,14 +941,25 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                         st.json(resultado_vi['premissas'])
 
                     if st.button("💾 Gravar valores intrínsecos no banco"):
+                        ok_count, falha_count = 0, 0
                         for metodo, vi in [("simplificado",resultado_vi['vi_simplificado']),
                                            ("numero_graham",resultado_vi['vi_numero_graham']),
                                            ("complexo",resultado_vi['vi_complexo']),
                                            ("fcd",resultado_vi['vi_fcd'])]:
                             if vi:
-                                sb_upsert("valor_intrinseco",{"empresa_id":emp_id,"data_referencia":data_ref,
-                                    "metodo":metodo,"valor":vi,"premissas_json":resultado_vi['premissas']})
-                        st.success("✅ Todos os valores intrínsecos gravados.")
+                                try:
+                                    res = sb_upsert("valor_intrinseco",{"empresa_id":emp_id,"data_referencia":data_ref,
+                                        "metodo":metodo,"valor":vi,"premissas_json":resultado_vi['premissas']})
+                                    ok_count += 1 if res else 0
+                                    falha_count += 0 if res else 1
+                                except Exception:
+                                    falha_count += 1
+                        if falha_count == 0 and ok_count > 0:
+                            st.success(f"✅ {ok_count} valor(es) intrínseco(s) gravado(s) com sucesso.")
+                        elif ok_count > 0:
+                            st.warning(f"⚠️ {ok_count} gravado(s), mas {falha_count} falharam.")
+                        else:
+                            st.error("❌ Não foi possível gravar os valores intrínsecos.")
 
             elif step == 3:
                 st.write("**Etapa 3 — Avaliação qualitativa.**")
@@ -913,8 +972,10 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                     prev = st.selectbox("Previsibilidade",["baixa","media","alta"],index=["baixa","media","alta"].index(atual.get("previsibilidade","media")) if atual.get("previsibilidade") else 1)
                     circulo = st.checkbox("Dentro do meu círculo de competência?", bool(atual.get("circulo_competencia",False)))
                     if st.form_submit_button("💾 Salvar avaliação"):
-                        sb_upsert("avaliacao_qualitativa_buffett",{"empresa_id":emp_id,"moat":moat,"moat_justificativa":moat_just,"qualidade_gestao":gestao,"previsibilidade":prev,"circulo_competencia":circulo,"data_avaliacao":date.today().isoformat()})
-                        st.success("Avaliação salva.")
+                        gravar_com_confirmacao(sb_upsert, "avaliacao_qualitativa_buffett",
+                            {"empresa_id":emp_id,"moat":moat,"moat_justificativa":moat_just,"qualidade_gestao":gestao,
+                             "previsibilidade":prev,"circulo_competencia":circulo,"data_avaliacao":date.today().isoformat()},
+                            msg_ok="✅ Avaliação salva com sucesso.", msg_erro="❌ Não foi possível salvar a avaliação.")
 
             elif step == 4:
                 st.write("**Etapa 4 — Relatório final: Comprar, Manter ou Vender?**")
@@ -946,8 +1007,9 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
 
                     st.markdown("---")
                     if st.button("✅ Concluir análise desta ação", type="primary"):
-                        sb_update("lista_analise",{"status":"analisada"},{"empresa_id":emp_id,"usuario_id":usuario_id()})
-                        st.success("Análise concluída!")
+                        gravar_com_confirmacao(sb_update, "lista_analise", {"status":"analisada"},
+                            {"empresa_id":emp_id,"usuario_id":usuario_id()},
+                            msg_ok="✅ Análise concluída com sucesso!", msg_erro="❌ Não foi possível concluir a análise.")
 
             st.markdown("---")
             n1,n2,_ = st.columns([1,1,4])
@@ -1019,13 +1081,16 @@ elif pagina == "1. Empresas e Setores":
                     st.error("❌ Digite o código do ticker antes de adicionar.")
                 else:
                     ta_id_tk = next((t["id"] for t in tipos_ativo if t["nome"] == novo_tipo_nome), None)
-                    sb_upsert("ativos_empresa", {"empresa_id": empresa_id_edicao, "codigo": novo_codigo.upper(),
-                                                  "tipo_ativo_id": ta_id_tk, "ativo": True})
+                    r1 = gravar_com_confirmacao(sb_upsert, "ativos_empresa",
+                        {"empresa_id": empresa_id_edicao, "codigo": novo_codigo.upper(),
+                         "tipo_ativo_id": ta_id_tk, "ativo": True},
+                        msg_ok=f"✅ Ticker {novo_codigo.upper()} adicionado com sucesso.",
+                        msg_erro="❌ Não foi possível adicionar o ticker.")
                     # se a empresa ainda não tem ticker principal, este vira o principal
-                    if not dados_atuais.get("ticker"):
-                        sb_upsert("empresas", {"id": empresa_id_edicao, "ticker": novo_codigo.upper()})
-                    st.success(f"Ticker {novo_codigo.upper()} adicionado.")
-                    st.rerun()
+                    if r1 and not dados_atuais.get("ticker"):
+                        sb_update("empresas", {"ticker": novo_codigo.upper()}, {"id": empresa_id_edicao})
+                    if r1:
+                        st.rerun()
     else:
         st.info("Salve a empresa primeiro (com pelo menos um ticker abaixo) para depois adicionar tickers extras.")
 
@@ -1091,43 +1156,51 @@ elif pagina == "1. Empresas e Setores":
                 st.error(f"❌ Não foi possível salvar — preencha: {', '.join(faltando)}.")
             else:
                 setor_id = next((s["id"] for s in setores if s["nome"]==setor_nome), None)
+                ta_id = next((t["id"] for t in tipos_ativo if t["nome"] == tipo_ativo_nome), None)
                 payload = {
                     "ticker": ticker_principal.strip().upper(), "cnpj": cnpj, "razao_social": razao,
                     "setor_id": setor_id, "tipo_mercado_codigo": tipo_m or None, "situacao_codigo": sit or None,
                     "site": site, "descricao_negocio": desc, "analise_futuro": futuro,
                     "segmento": segmento, "na_bolsa": na_bolsa, "eh_banco": eh_banco,
                 }
-                if empresa_id_edicao:
-                    payload["id"] = empresa_id_edicao
-                ta_id = next((t["id"] for t in tipos_ativo if t["nome"] == tipo_ativo_nome), None)
                 if ta_id:
                     payload["tipo_ativo_id"] = ta_id
 
-                r_emp = sb_upsert("empresas", payload)
-                eid_salvo = empresa_id_edicao
-                if not eid_salvo:
-                    achado = sb_select("empresas","id",filtros={"ticker":ticker_principal.strip().upper()})
-                    eid_salvo = achado[0]["id"] if achado else None
+                if empresa_id_edicao:
+                    # empresa já existe — UPDATE por id (não upsert, pra não depender de
+                    # qual coluna o upsert usa como chave de conflito)
+                    r_emp = gravar_com_confirmacao(sb_update, "empresas", payload, {"id": empresa_id_edicao},
+                        msg_ok=f"✅ Empresa {ticker_principal.strip().upper()} atualizada com sucesso.",
+                        msg_erro="❌ Não foi possível atualizar a empresa.")
+                    eid_salvo = empresa_id_edicao if r_emp else None
+                else:
+                    # empresa nova — INSERT
+                    r_emp = gravar_com_confirmacao(sb_insert, "empresas", payload,
+                        msg_ok=f"✅ Empresa {ticker_principal.strip().upper()} cadastrada com sucesso.",
+                        msg_erro="❌ Não foi possível cadastrar a empresa (confira se o ticker já existe).")
+                    eid_salvo = r_emp[0]["id"] if r_emp else None
 
                 # garante que o ticker principal também exista na lista de ativos
                 if eid_salvo:
                     ja_existe_tk = sb_select("ativos_empresa","id",filtros={"empresa_id":eid_salvo,"codigo":ticker_principal.strip().upper()})
                     if not ja_existe_tk:
-                        sb_upsert("ativos_empresa", {"empresa_id": eid_salvo, "codigo": ticker_principal.strip().upper(),
-                                                      "tipo_ativo_id": ta_id, "ativo": True})
+                        gravar_com_confirmacao(sb_upsert, "ativos_empresa",
+                            {"empresa_id": eid_salvo, "codigo": ticker_principal.strip().upper(),
+                             "tipo_ativo_id": ta_id, "ativo": True},
+                            msg_ok="✅ Ticker principal registrado na lista de ativos.",
+                            msg_erro="⚠️ Empresa salva, mas não foi possível registrar o ticker na lista de ativos.")
 
                 if eh_banco and eid_salvo:
-                    try:
-                        sb_upsert("bancos_dados", {
-                            "empresa_id": eid_salvo, "cnpj": cnpj,
-                            "indice_basileia": indice_basileia, "carteira_credito": carteira_credito,
-                            "fator_risco": fator_risco, "link_informacoes": link_info_banco,
-                            "data_referencia": str(date.today()), "fonte": "Manual",
-                        })
-                    except Exception as e:
-                        st.warning(f"Empresa salva, mas houve um erro ao salvar dados de banco: {e}")
+                    gravar_com_confirmacao(sb_upsert, "bancos_dados", {
+                        "empresa_id": eid_salvo, "cnpj": cnpj,
+                        "indice_basileia": indice_basileia, "carteira_credito": carteira_credito,
+                        "fator_risco": fator_risco, "link_informacoes": link_info_banco,
+                        "data_referencia": str(date.today()), "fonte": "Manual",
+                    }, msg_ok="✅ Dados de banco salvos com sucesso.",
+                       msg_erro="⚠️ Empresa salva, mas houve um erro ao salvar dados de banco.")
 
-                st.success(f"✅ Empresa {ticker_principal.strip().upper()} salva."); st.rerun()
+                if eid_salvo:
+                    st.rerun()
 
     # ---- Rating: busca (links de conferência) + edição manual — só em modo edição ----
     if empresa_id_edicao:
@@ -1154,10 +1227,13 @@ elif pagina == "1. Empresas e Setores":
             novo_preco_alvo = rm4.number_input("Preço alvo analistas (opcional)", min_value=0.0, step=0.01,
                                                 value=float(dados_atuais.get("preco_alvo_analistas") or 0.0))
             if st.form_submit_button("💾 Salvar rating"):
-                sb_upsert("empresas", {"id": empresa_id_edicao, "rating": novo_rating,
-                                       "rating_agencia": nova_agencia, "rating_perspectiva": nova_persp,
-                                       "preco_alvo_analistas": novo_preco_alvo})
-                st.success("Rating atualizado."); st.rerun()
+                r = gravar_com_confirmacao(sb_upsert, "empresas", {
+                    "id": empresa_id_edicao, "ticker": dados_atuais.get("ticker"),
+                    "rating": novo_rating, "rating_agencia": nova_agencia,
+                    "rating_perspectiva": nova_persp, "preco_alvo_analistas": novo_preco_alvo,
+                }, msg_ok="✅ Rating salvo com sucesso.", msg_erro="❌ Não foi possível salvar o rating.")
+                if r:
+                    st.rerun()
 
     # ---- Botões extras — só aparecem em modo edição ----
     if empresa_id_edicao:
@@ -1189,18 +1265,34 @@ elif pagina == "1. Empresas e Setores":
                     dados_bal = calc.buscar_balanco_yfinance(dados_atuais["ticker"])
                     if dados_bal.get("data_referencia"):
                         dados_bal["empresa_id"] = empresa_id_edicao
-                        sb_upsert("balancos_dre", {k:v for k,v in dados_bal.items() if v is not None})
-                        ind_novo = calc.calcular_indicadores(dados_bal)
-                        for nome, valor in ind_novo.items():
-                            match = next((x for x in inds_def if x["nome"]==nome), None)
-                            if match and valor is not None:
-                                sb_upsert("indicadores_calculados", {
-                                    "empresa_id": empresa_id_edicao, "data_referencia": dados_bal["data_referencia"],
-                                    "indicador_id": match["id"], "valor": valor,
-                                    "fonte": "Yahoo Finance", "atualizado_em": pd.Timestamp.now().isoformat(),
-                                })
-                        st.success(f"Indicadores atualizados com dados de {dados_bal['data_referencia']} (fonte: Yahoo Finance).")
-                        st.rerun()
+                        r_bal = gravar_com_confirmacao(sb_upsert, "balancos_dre",
+                            {k:v for k,v in dados_bal.items() if v is not None},
+                            msg_ok=f"✅ Balanço de {dados_bal['data_referencia']} salvo.",
+                            msg_erro="❌ Não foi possível salvar o balanço buscado.")
+                        if r_bal:
+                            ind_novo = calc.calcular_indicadores(dados_bal)
+                            ok_count, falha_count = 0, 0
+                            for nome, valor in ind_novo.items():
+                                match = next((x for x in inds_def if x["nome"]==nome), None)
+                                if match and valor is not None:
+                                    try:
+                                        res = sb_upsert("indicadores_calculados", {
+                                            "empresa_id": empresa_id_edicao, "data_referencia": dados_bal["data_referencia"],
+                                            "indicador_id": match["id"], "valor": valor,
+                                            "fonte": "Yahoo Finance", "atualizado_em": pd.Timestamp.now().isoformat(),
+                                        })
+                                        ok_count += 1 if res else 0
+                                        falha_count += 0 if res else 1
+                                    except Exception:
+                                        falha_count += 1
+                            if falha_count == 0 and ok_count > 0:
+                                st.success(f"✅ {ok_count} indicador(es) atualizado(s) com sucesso "
+                                           f"(fonte: Yahoo Finance, data: {dados_bal['data_referencia']}).")
+                                st.rerun()
+                            elif ok_count > 0:
+                                st.warning(f"⚠️ {ok_count} atualizado(s), mas {falha_count} falharam.")
+                            else:
+                                st.error("❌ Não foi possível atualizar os indicadores.")
                     else:
                         st.warning("Não encontrou dados de balanço recentes para este ticker.")
                 except Exception as e:
@@ -1227,9 +1319,11 @@ elif pagina == "1. Empresas e Setores":
                 ano_h = hc1.number_input("Ano", min_value=1990, max_value=2100, value=date.today().year-1, step=1)
                 lucro_h = hc2.number_input("Lucro líquido (negativo = prejuízo)", step=1000.0)
                 if hc3.form_submit_button("➕ Adicionar"):
-                    sb_upsert("historico_resultados", {"empresa_id": empresa_id_edicao, "ano": int(ano_h),
-                                                        "lucro_liquido": lucro_h, "fonte": "Manual"})
-                    st.success("Registro adicionado."); st.rerun()
+                    r = gravar_com_confirmacao(sb_upsert, "historico_resultados",
+                        {"empresa_id": empresa_id_edicao, "ano": int(ano_h), "lucro_liquido": lucro_h, "fonte": "Manual"},
+                        msg_ok="✅ Registro adicionado com sucesso.", msg_erro="❌ Não foi possível adicionar o registro.")
+                    if r:
+                        st.rerun()
 
         elif secao == "noticias":
             st.markdown("#### 📰 Notícias Relevantes")
@@ -1304,7 +1398,7 @@ elif pagina == "4. Critérios e Índice de Qualidade":
                         av=(av_c[0] if av_c else {}), banco_dados=(banco_c[0] if banco_c else {}),
                         historico_lucros=historico_c,
                     )
-                    sb_upsert("indice_boa_empresa", {
+                    res_ibe = sb_upsert("indice_boa_empresa", {
                         "empresa_id": eid, "data_calculo": date.today().isoformat(),
                         "nota_valuation": resultado_c["nota_valuation"],
                         "nota_qualidade_financeira": resultado_c["nota_qualidade_financeira"],
@@ -1314,14 +1408,20 @@ elif pagina == "4. Critérios e Índice de Qualidade":
                         "classificacao": resultado_c["classificacao"],
                         "detalhes": resultado_c["detalhes"],
                     })
+                    if not res_ibe:
+                        erros.append(f"{row['ticker']}: calculado mas não confirmado salvo no banco")
                 except Exception as e:
                     erros.append(f"{row['ticker']}: {e}")
                 progresso.progress((i + 1) / total, text=f"{i+1}/{total} — {row['ticker']}")
             progresso.empty()
             if erros:
-                st.warning("Algumas empresas não puderam ser calculadas (dado faltando não trava as demais):\n\n"
+                st.warning("Algumas empresas não puderam ser calculadas/salvas (dado faltando não trava as demais):\n\n"
                            + "\n".join(f"- {e}" for e in erros))
-            st.success("Recálculo concluído.")
+            sucesso_count = total - len(erros)
+            if sucesso_count > 0:
+                st.success(f"✅ {sucesso_count} de {total} empresa(s) recalculada(s) e salva(s) com sucesso.")
+            else:
+                st.error("❌ Nenhuma empresa pôde ser calculada/salva.")
 
         linhas = []
         for _, row in df_todas.iterrows():
@@ -1359,7 +1459,10 @@ elif pagina == "6. Carteira":
     with st.form("nova_carteira"):
         nome_c = st.text_input("Nova carteira")
         if st.form_submit_button("Criar") and nome_c:
-            sb_insert("carteiras",{"nome":nome_c,"usuario_id":uid}); st.rerun()
+            r = gravar_com_confirmacao(sb_insert, "carteiras", {"nome":nome_c,"usuario_id":uid},
+                msg_ok=f"✅ Carteira '{nome_c}' criada com sucesso.", msg_erro="❌ Não foi possível criar a carteira.")
+            if r:
+                st.rerun()
 
     carteiras = minhas_carteiras()
     if not carteiras:
@@ -1398,7 +1501,7 @@ elif pagina == "6. Carteira":
                         st.error("Colunas não encontradas. Verifique o arquivo.")
                     else:
                         hoje = dt.date.today().isoformat()
-                        imp = 0
+                        imp, falhas = 0, 0
                         for _,row in df_p.iterrows():
                             tk = str(row[ct]).strip().upper()
                             if not tk or tk=="NAN": continue
@@ -1407,14 +1510,24 @@ elif pagina == "6. Carteira":
                             else:
                                 r = sb_insert("empresas",{"ticker":tk,"razao_social":tk})
                                 eid = r[0]["id"] if r else None
-                                st.warning(f"Empresa '{tk}' criada automaticamente. Complete o cadastro na Tela 1.")
+                                if eid:
+                                    st.warning(f"Empresa '{tk}' criada automaticamente. Complete o cadastro na Tela 1.")
                             if eid:
-                                sb_upsert("carteira_posicoes_importadas",{"carteira_id":cart_id,"empresa_id":eid,
+                                res_pos = sb_upsert("carteira_posicoes_importadas",{"carteira_id":cart_id,"empresa_id":eid,
                                     "quantidade":float(row[cq]),"valor_medio":float(row[cv]),
                                     "data_importacao":hoje,"arquivo_origem":arq.name})
-                                imp+=1
-                        st.success(f"{imp} posição(ões) importada(s).")
-                        st.rerun()
+                                if res_pos:
+                                    imp+=1
+                                else:
+                                    falhas+=1
+                            else:
+                                falhas+=1
+                        if imp > 0:
+                            st.success(f"✅ {imp} posição(ões) importada(s) com sucesso.")
+                        if falhas > 0:
+                            st.error(f"❌ {falhas} posição(ões) não puderam ser importadas.")
+                        if imp > 0:
+                            st.rerun()
 
         with aba_res:
             ano = pd.Timestamp.now().year
@@ -1487,8 +1600,12 @@ elif pagina == "6. Carteira":
                     tot = qtd*preco_u + (taxas if tipo=="compra" else -taxas)
                     st.write(f"**Total da operação: R$ {tot:,.2f}**")
                     if st.form_submit_button("Registrar operação"):
-                        sb_insert("movimentos_carteira",{"carteira_id":cart_id,"empresa_id":int(empresa["id"]),"tipo":tipo,"data":data_m,"quantidade":qtd,"preco_unitario":preco_u,"taxas":taxas,"total_operacao":tot,"origem":"manual"})
-                        st.success("Operação registrada."); st.rerun()
+                        r = gravar_com_confirmacao(sb_insert, "movimentos_carteira",
+                            {"carteira_id":cart_id,"empresa_id":int(empresa["id"]),"tipo":tipo,"data":data_m,
+                             "quantidade":qtd,"preco_unitario":preco_u,"taxas":taxas,"total_operacao":tot,"origem":"manual"},
+                            msg_ok="✅ Operação registrada com sucesso.", msg_erro="❌ Não foi possível registrar a operação.")
+                        if r:
+                            st.rerun()
                 movs = sb_select("movimentos_carteira","tipo,data,quantidade,preco_unitario,taxas,total_operacao",filtros={"carteira_id":cart_id,"empresa_id":int(empresa["id"])},ordem="data")
                 st.dataframe(pd.DataFrame(movs), use_container_width=True)
 
@@ -1502,8 +1619,11 @@ elif pagina == "6. Carteira":
                     vp = c3.number_input("Valor",value=0.0)
                     obs = st.text_input("Observação")
                     if st.form_submit_button("Registrar") and dp and vp:
-                        sb_insert("proventos_recebidos",{"carteira_id":cart_id,"empresa_id":int(empresa_p["id"]),"data":dp,"tipo":tp,"valor":vp,"observacao":obs})
-                        st.success("Provento registrado."); st.rerun()
+                        r = gravar_com_confirmacao(sb_insert, "proventos_recebidos",
+                            {"carteira_id":cart_id,"empresa_id":int(empresa_p["id"]),"data":dp,"tipo":tp,"valor":vp,"observacao":obs},
+                            msg_ok="✅ Provento registrado com sucesso.", msg_erro="❌ Não foi possível registrar o provento.")
+                        if r:
+                            st.rerun()
                 provs = sb_select("proventos_recebidos","data,tipo,valor,observacao",filtros={"carteira_id":cart_id,"empresa_id":int(empresa_p["id"])},ordem="data")
                 st.dataframe(pd.DataFrame(provs), use_container_width=True)
 
@@ -1522,9 +1642,11 @@ elif pagina == "11. Administração de Usuários":
             novo_tipo = st.selectbox("Novo tipo", ["usuario","administrador"])
             if st.button("💾 Salvar alteração"):
                 uid_alvo = next(p["id"] for p in perfis if p["email"]==email_alvo)
-                sb_update("perfis",{"tipo":novo_tipo},{"id":uid_alvo})
-                st.success(f"Tipo de acesso de {email_alvo} alterado para {novo_tipo}.")
-                st.rerun()
+                r = gravar_com_confirmacao(sb_update, "perfis", {"tipo":novo_tipo}, {"id":uid_alvo},
+                    msg_ok=f"✅ Tipo de acesso de {email_alvo} alterado para {novo_tipo}.",
+                    msg_erro="❌ Não foi possível alterar o tipo de acesso.")
+                if r:
+                    st.rerun()
         st.subheader("Atualizar dados do perfil de um usuário")
         if perfis:
             email_p = st.selectbox("Usuário (perfil)", emails, key="upd_perfil")
@@ -1535,8 +1657,11 @@ elif pagina == "11. Administração de Usuários":
                 nome = st.text_input("Nome", p_sel.get("nome","") or "")
                 tel = st.text_input("Telefone", p_sel.get("telefone","") or "")
                 if st.form_submit_button("Salvar"):
-                    sb_update("perfis",{"codigo":cod,"cpf":cpf,"nome":nome,"telefone":tel},{"id":p_sel["id"]})
-                    st.success("Perfil atualizado."); st.rerun()
+                    r = gravar_com_confirmacao(sb_update, "perfis",
+                        {"codigo":cod,"cpf":cpf,"nome":nome,"telefone":tel}, {"id":p_sel["id"]},
+                        msg_ok="✅ Perfil atualizado com sucesso.", msg_erro="❌ Não foi possível atualizar o perfil.")
+                    if r:
+                        st.rerun()
 
 # ================================================================
 elif pagina == "9. Índices Macroeconômicos":
@@ -1651,9 +1776,11 @@ elif pagina == "9. Índices Macroeconômicos":
                        "valor": no_mes_m, "no_mes": no_mes_m, "fonte": fonte_m}
                 if no_ano_m: reg["no_ano"] = no_ano_m
                 if em_12m_m: reg["em_12_meses"] = em_12m_m
-                sb_upsert("indices_macroeconomicos", reg)
-                st.success(f"{ind_n} {int(ano_m)}/{int(mes_m):02d} salvo.")
-                st.rerun()
+                r = gravar_com_confirmacao(sb_upsert, "indices_macroeconomicos", reg,
+                    msg_ok=f"✅ {ind_n} {int(ano_m)}/{int(mes_m):02d} salvo com sucesso.",
+                    msg_erro="❌ Não foi possível salvar o índice.")
+                if r:
+                    st.rerun()
 
     with aba_hist_i:
         filtro_i = st.selectbox("Filtrar por índice", ["Todos"] + INDICES_LISTA)
@@ -1683,8 +1810,11 @@ elif pagina == "10. Tabelas de Apoio":
             if not ns_apoio.strip():
                 st.error("❌ Digite o nome do setor.")
             else:
-                sb_insert("setores",{"nome":ns_apoio.strip()})
-                st.success(f"Setor '{ns_apoio.strip()}' adicionado."); st.rerun()
+                r = gravar_com_confirmacao(sb_insert, "setores", {"nome":ns_apoio.strip()},
+                    msg_ok=f"✅ Setor '{ns_apoio.strip()}' adicionado com sucesso.",
+                    msg_erro="❌ Não foi possível adicionar o setor.")
+                if r:
+                    st.rerun()
     st.markdown("---")
     st.subheader("Tipo de Mercado (Segmento de listagem B3)")
     st.dataframe(pd.DataFrame(sb_select("tipo_mercado")), use_container_width=True)
@@ -1708,8 +1838,12 @@ elif pagina == "10. Tabelas de Apoio":
         fi_i = st.text_input("Descrição faixa ideal")
         tc_i = st.selectbox("Tipo cálculo",["fundamentalista_atual","fundamentalista_historico","qualitativo","pendente_implementacao"],index=3)
         if st.form_submit_button("Cadastrar") and cod_i and nom_i:
-            sb_upsert("indicadores_definicao",{"codigo":cod_i.upper(),"nome":nom_i,"categoria":cat_i,"formula":form_i,"faixa_ideal":fi_i,"tipo_calculo":tc_i,"grandeza":gr_i,"valor_referencia":vr_i})
-            st.success(f"Indicador '{nom_i}' cadastrado."); st.rerun()
+            r = gravar_com_confirmacao(sb_upsert, "indicadores_definicao",
+                {"codigo":cod_i.upper(),"nome":nom_i,"categoria":cat_i,"formula":form_i,
+                 "faixa_ideal":fi_i,"tipo_calculo":tc_i,"grandeza":gr_i,"valor_referencia":vr_i},
+                msg_ok=f"✅ Indicador '{nom_i}' cadastrado com sucesso.", msg_erro="❌ Não foi possível cadastrar o indicador.")
+            if r:
+                st.rerun()
 
 else:
     # Para telas não implementadas neste arquivo ainda, mostrar aviso informativo
