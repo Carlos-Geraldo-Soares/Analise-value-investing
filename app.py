@@ -175,6 +175,271 @@ def buscar_cotacao_tempo_real(ticker):
         return 0.0
 
 
+# ---------- ÍNDICE DE BOA EMPRESA ----------
+# Critérios definidos no docx: Valuation 30% (ou Rating 30% quando a empresa
+# tem rating de crédito) + Qualidade Financeira 45% + Qualidade do Negócio 25%.
+# Rating só pontua de A- pra cima. Bancos usam Índice de Basileia em vez de
+# Dívida Bruta/Patrimônio dentro da Qualidade Financeira.
+# Nota final 0-100: >=70 Boa empresa | 50-70 Observar | <50 Evitar.
+# Qualquer dado que faltar entra como 0/neutro e nunca trava o cálculo —
+# os critérios abaixo são a proposta inicial pra você validar/ajustar.
+
+def _norm_chave(s):
+    s = str(s).strip().lower()
+    s = "".join(x for x in unicodedata.normalize("NFKD", s) if not unicodedata.combining(x))
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def _buscar_indicador(ind_dict, *nomes_candidatos):
+    if not ind_dict:
+        return None
+    chaves_norm = {_norm_chave(k): v for k, v in ind_dict.items()}
+    for nome in nomes_candidatos:
+        n = _norm_chave(nome)
+        if n in chaves_norm:
+            try:
+                return float(chaves_norm[n])
+            except (TypeError, ValueError):
+                return None
+    for nome in nomes_candidatos:
+        n = _norm_chave(nome)
+        for k, v in chaves_norm.items():
+            if n and (n in k or k in n):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def _interp(x, x0, y0, x1, y1):
+    if x1 == x0:
+        return y0
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+
+
+def _score_crescente(x, pontos):
+    """pontos: [(x0,score0), (x1,score1), ...] em ordem crescente de x."""
+    if x is None:
+        return None
+    if x <= pontos[0][0]:
+        return pontos[0][1]
+    for (x0, y0), (x1, y1) in zip(pontos, pontos[1:]):
+        if x <= x1:
+            return _interp(x, x0, y0, x1, y1)
+    return pontos[-1][1]
+
+
+def _score_pl(pl):
+    if pl is None:
+        return None
+    if pl <= 0:
+        return 0.0
+    if pl <= 8:
+        return 100.0
+    if pl <= 15:
+        return _interp(pl, 8, 100, 15, 60)
+    if pl <= 25:
+        return _interp(pl, 15, 60, 25, 20)
+    return 0.0
+
+
+def _score_pvp(pvp):
+    if pvp is None:
+        return None
+    if pvp <= 0:
+        return 0.0
+    if pvp <= 1:
+        return 100.0
+    if pvp <= 2:
+        return _interp(pvp, 1, 100, 2, 60)
+    if pvp <= 4:
+        return _interp(pvp, 2, 60, 4, 20)
+    return 0.0
+
+
+def _score_margem_seguranca(margem_pct):
+    """margem = (VI médio - preço) / VI médio * 100. 0% = neutro (50 pts)."""
+    if margem_pct is None:
+        return None
+    return max(0.0, min(100.0, 50 + margem_pct))
+
+
+def _score_divida_pl(x):
+    if x is None:
+        return None
+    if x <= 0.3:
+        return 100.0
+    if x <= 0.7:
+        return _interp(x, 0.3, 100, 0.7, 60)
+    if x <= 1.5:
+        return _interp(x, 0.7, 60, 1.5, 20)
+    return 0.0
+
+
+def _score_basileia(x):
+    """Mínimo regulatório do BCB é ~11%; abaixo disso é zerado."""
+    if x is None:
+        return None
+    if x < 11:
+        return 0.0
+    if x <= 14:
+        return _interp(x, 11, 40, 14, 70)
+    if x <= 18:
+        return _interp(x, 14, 70, 18, 100)
+    return 100.0
+
+
+_MAPA_RATING = {
+    "AAA": 100.0, "AA+": 95.0, "AA": 90.0, "AA-": 85.0,
+    "A+": 80.0, "A": 75.0, "A-": 70.0,
+}
+
+
+def _score_rating(rating_str):
+    """Só ganha ponto de A- pra cima — abaixo disso vira 0, conforme pedido."""
+    if not rating_str:
+        return None
+    return _MAPA_RATING.get(rating_str.strip().upper(), 0.0)
+
+
+def _calc_cagr(valores):
+    vs = [v for v in valores if v]
+    if len(vs) < 2:
+        return None
+    primeiro, ultimo, n = vs[0], vs[-1], len(vs) - 1
+    if primeiro <= 0 or ultimo <= 0 or n <= 0:
+        return None
+    try:
+        return ((ultimo / primeiro) ** (1 / n) - 1) * 100
+    except Exception:
+        return None
+
+
+def _calc_pct_anos_lucro(valores):
+    vs = [v for v in valores if v is not None]
+    if not vs:
+        return None
+    return sum(1 for v in vs if v > 0) / len(vs) * 100
+
+
+def _media_ignorando_none(*valores):
+    vals = [v for v in valores if v is not None]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def calcular_indice_boa_empresa(emp, ind=None, preco=None, vi_medio=None,
+                                 av=None, banco_dados=None, historico_lucros=None):
+    """
+    Calcula o Índice de Boa Empresa (0-100) de uma empresa.
+    Nunca estoura erro: qualquer dado ausente entra como 0/neutro no cálculo
+    e fica registrado em 'detalhes' para você conferir o que faltou.
+    Retorna um dict pronto para exibir e para gravar em indice_boa_empresa.
+    """
+    ind = ind or {}
+    av = av or {}
+    banco_dados = banco_dados or {}
+    historico_lucros = historico_lucros or []
+
+    pl = _buscar_indicador(ind, "P/L", "PL")
+    pvp = _buscar_indicador(ind, "P/VP", "PVP")
+    roe = _buscar_indicador(ind, "ROE")
+    roic = _buscar_indicador(ind, "ROIC")
+    margem_liq = _buscar_indicador(ind, "Margem Líquida", "Margem Liquida", "Mrg Liq")
+    divida_pl = _buscar_indicador(ind, "Dívida Bruta/Patrimônio", "Divida Bruta Patrimonio", "Div Brut Patrim")
+
+    margem_seguranca = None
+    if preco and vi_medio and vi_medio > 0:
+        margem_seguranca = (vi_medio - preco) / vi_medio * 100
+
+    cagr5 = _calc_cagr(historico_lucros)
+    pct_anos_lucro = _calc_pct_anos_lucro(historico_lucros)
+
+    score_pl = _score_pl(pl)
+    score_pvp = _score_pvp(pvp)
+    score_margem_seg = _score_margem_seguranca(margem_seguranca)
+    score_roe = _score_crescente(roe, [(0, 0), (5, 30), (15, 70), (25, 100)])
+    score_roic = _score_crescente(roic, [(0, 0), (5, 30), (15, 70), (25, 100)])
+    score_margem_liq = _score_crescente(margem_liq, [(0, 0), (5, 30), (15, 70), (30, 100)])
+
+    eh_banco = bool(emp.get("eh_banco"))
+    if eh_banco:
+        score_alavancagem = _score_basileia(banco_dados.get("indice_basileia"))
+        nome_criterio_alavancagem = "Índice de Basileia (%)"
+        valor_alavancagem = banco_dados.get("indice_basileia")
+    else:
+        score_alavancagem = _score_divida_pl(divida_pl)
+        nome_criterio_alavancagem = "Dívida Bruta/Patrimônio"
+        valor_alavancagem = divida_pl
+
+    score_cresc5a = _score_crescente(cagr5, [(0, 0), (5, 40), (15, 80), (25, 100)])
+    score_hist_positivo = pct_anos_lucro
+
+    nota_valuation = _media_ignorando_none(score_pl, score_pvp, score_margem_seg)
+    nota_qualidade_financeira = _media_ignorando_none(
+        score_roe, score_roic, score_margem_liq, score_alavancagem, score_cresc5a, score_hist_positivo)
+
+    moat_score = {"nenhum": 0.0, "fraco": 33.0, "moderado": 66.0, "forte": 100.0}.get(av.get("moat"))
+    gestao_val = av.get("qualidade_gestao")
+    gestao_score = (float(gestao_val) - 1) / 4 * 100 if gestao_val is not None else None
+    prev_score = {"baixa": 0.0, "media": 50.0, "alta": 100.0}.get(av.get("previsibilidade"))
+    circulo_score = None
+    if "circulo_competencia" in av and av.get("circulo_competencia") is not None:
+        circulo_score = 100.0 if av.get("circulo_competencia") else 0.0
+
+    nota_qualidade_negocio = _media_ignorando_none(moat_score, gestao_score, prev_score, circulo_score)
+
+    rating_str = (emp.get("rating") or "").strip()
+    nota_rating = _score_rating(rating_str) if rating_str else None
+
+    if nota_rating is not None:
+        componente_30, fonte_30 = nota_rating, "Rating"
+    else:
+        componente_30, fonte_30 = nota_valuation, "Valuation"
+
+    nota_final = round(componente_30 * 0.30 + nota_qualidade_financeira * 0.45 + nota_qualidade_negocio * 0.25, 1)
+    if nota_final >= 70:
+        classificacao = "Boa empresa"
+    elif nota_final >= 50:
+        classificacao = "Observar"
+    else:
+        classificacao = "Evitar"
+
+    return {
+        "nota_final": nota_final,
+        "classificacao": classificacao,
+        "componente_30_fonte": fonte_30,
+        "nota_valuation": round(nota_valuation, 1),
+        "nota_qualidade_financeira": round(nota_qualidade_financeira, 1),
+        "nota_qualidade_negocio": round(nota_qualidade_negocio, 1),
+        "nota_rating": round(nota_rating, 1) if nota_rating is not None else None,
+        "detalhes": {
+            "valuation (peso 30%, ou Rating se disponível)": {
+                "P/L": pl, "score": score_pl,
+                "P/VP": pvp, "score_pvp": score_pvp,
+                "margem_seguranca_%": round(margem_seguranca, 1) if margem_seguranca is not None else None,
+                "score_margem_seguranca": score_margem_seg,
+            },
+            "qualidade_financeira (peso 45%)": {
+                "ROE_%": roe, "score_roe": score_roe,
+                "ROIC_%": roic, "score_roic": score_roic,
+                "margem_liquida_%": margem_liq, "score_margem_liquida": score_margem_liq,
+                nome_criterio_alavancagem: valor_alavancagem, "score_alavancagem": score_alavancagem,
+                "crescimento_lucro_5a_%": round(cagr5, 1) if cagr5 is not None else None,
+                "score_crescimento_5a": score_cresc5a,
+                "pct_anos_com_lucro": round(pct_anos_lucro, 1) if pct_anos_lucro is not None else None,
+            },
+            "qualidade_negocio (peso 25%)": {
+                "moat": av.get("moat"), "score_moat": moat_score,
+                "qualidade_gestao_1a5": gestao_val, "score_gestao": gestao_score,
+                "previsibilidade": av.get("previsibilidade"), "score_previsibilidade": prev_score,
+                "circulo_competencia": av.get("circulo_competencia"), "score_circulo": circulo_score,
+            },
+            "rating": {"rating": rating_str or None, "nota_rating": nota_rating},
+        },
+    }
+
+
 def lista_empresas():
     dados = sb_select("empresas", "id,ticker,cnpj,razao_social,setor_id,subsetor_id", ordem="ticker")
     return pd.DataFrame(dados) if dados else pd.DataFrame()
@@ -585,6 +850,40 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                     if av:
                         a = av[0]
                         st.write(f"Avaliação: Moat **{a['moat']}** | Gestão nota **{a['qualidade_gestao']}** | Previsibilidade **{a['previsibilidade']}**")
+
+                    st.markdown("---")
+                    st.subheader("⭐ Índice de Boa Empresa")
+                    banco_reg = sb_select("bancos_dados","*",filtros={"empresa_id":emp_id}) if emp.get("eh_banco") else []
+                    historico_lucros = [b.get("net_income") for b in sorted(bals, key=lambda x: x["data_referencia"]) if b.get("net_income") is not None]
+                    resultado_ibe = calcular_indice_boa_empresa(
+                        emp=emp, ind=ind if bals else {}, preco=preco,
+                        vi_medio=(sum(v["valor"] for v in vis)/len(vis)) if vis else None,
+                        av=(av[0] if av else {}), banco_dados=(banco_reg[0] if banco_reg else {}),
+                        historico_lucros=historico_lucros,
+                    )
+                    cor_ibe = {"Boa empresa":"green","Observar":"orange","Evitar":"red"}[resultado_ibe["classificacao"]]
+                    st.markdown(f"### Nota final: **{resultado_ibe['nota_final']}/100** — :{cor_ibe}[{resultado_ibe['classificacao']}]")
+                    b1,b2,b3 = st.columns(3)
+                    b1.metric(f"Valuation/Rating (30% — usando {resultado_ibe['componente_30_fonte']})",
+                              resultado_ibe['nota_rating'] if resultado_ibe['nota_rating'] is not None else resultado_ibe['nota_valuation'])
+                    b2.metric("Qualidade Financeira (45%)", resultado_ibe['nota_qualidade_financeira'])
+                    b3.metric("Qualidade do Negócio (25%)", resultado_ibe['nota_qualidade_negocio'])
+                    with st.expander("Ver detalhamento critério a critério (para validar)"):
+                        st.json(resultado_ibe["detalhes"])
+                    if st.button("💾 Salvar Índice de Boa Empresa"):
+                        sb_upsert("indice_boa_empresa", {
+                            "empresa_id": emp_id,
+                            "data_calculo": date.today().isoformat(),
+                            "nota_valuation": resultado_ibe["nota_valuation"],
+                            "nota_qualidade_financeira": resultado_ibe["nota_qualidade_financeira"],
+                            "nota_qualidade_negocio": resultado_ibe["nota_qualidade_negocio"],
+                            "nota_rating": resultado_ibe["nota_rating"],
+                            "nota_final": resultado_ibe["nota_final"],
+                            "classificacao": resultado_ibe["classificacao"],
+                            "detalhes": resultado_ibe["detalhes"],
+                        })
+                        st.success("Índice de Boa Empresa salvo.")
+
                     st.markdown("---")
                     if st.button("✅ Concluir análise desta ação", type="primary"):
                         sb_update("lista_analise",{"status":"analisada"},{"empresa_id":emp_id,"usuario_id":usuario_id()})
@@ -736,6 +1035,101 @@ elif pagina == "1. Empresas e Setores":
                     st.warning(f"Empresa salva, mas houve um erro ao salvar dados de banco: {e}")
 
             st.success(f"Empresa {ticker.upper()} salva."); st.rerun()
+
+# ================================================================
+elif pagina == "4. Critérios e Índice de Qualidade":
+    st.header("⭐ Índice de Boa Empresa — Screening")
+    st.caption("Critérios: Valuation 30% (ou Rating 30% quando disponível) + Qualidade Financeira 45% "
+               "+ Qualidade do Negócio 25%. Nota final ≥70 = Boa empresa, 50–70 = Observar, <50 = Evitar. "
+               "Recalcular usa os dados já cadastrados de cada empresa (balanço, indicadores, avaliação qualitativa).")
+
+    df_todas = lista_empresas()
+    if df_todas.empty:
+        st.info("Nenhuma empresa cadastrada ainda. Cadastre em '1. Empresas e Setores'.")
+    else:
+        c1, c2 = st.columns([1, 3])
+        recalcular_tudo = c1.button("🔄 Recalcular todas agora", type="primary")
+        classes_filtro = c2.multiselect("Filtrar por classificação",
+                                         ["Boa empresa", "Observar", "Evitar", "Não calculado"],
+                                         default=["Boa empresa", "Observar", "Evitar", "Não calculado"])
+
+        if recalcular_tudo:
+            progresso = st.progress(0.0, text="Calculando...")
+            erros = []
+            total = len(df_todas)
+            for i, row in df_todas.reset_index(drop=True).iterrows():
+                eid = int(row["id"])
+                try:
+                    emp_rows = sb_select("empresas", "*", filtros={"id": eid})
+                    if not emp_rows:
+                        continue
+                    emp_c = emp_rows[0]
+                    bals_c = sb_select("balancos_dre", "*", filtros={"empresa_id": eid}, ordem="data_referencia")
+                    if not bals_c:
+                        erros.append(f"{row['ticker']}: sem balanço cadastrado, pulado")
+                        continue
+                    bal_c = bals_c[-1]
+                    ind_c = calc.calcular_indicadores(bal_c)
+                    preco_c = bal_c.get("preco_mercado_referencia")
+                    vis_c = sb_select("valor_intrinseco", "metodo,valor",
+                                       filtros={"empresa_id": eid, "data_referencia": bal_c["data_referencia"]})
+                    vi_medio_c = (sum(v["valor"] for v in vis_c) / len(vis_c)) if vis_c else None
+                    av_c = sb_select("avaliacao_qualitativa_buffett", "*", filtros={"empresa_id": eid})
+                    banco_c = sb_select("bancos_dados", "*", filtros={"empresa_id": eid}) if emp_c.get("eh_banco") else []
+                    historico_c = [b.get("net_income") for b in bals_c if b.get("net_income") is not None]
+
+                    resultado_c = calcular_indice_boa_empresa(
+                        emp=emp_c, ind=ind_c, preco=preco_c, vi_medio=vi_medio_c,
+                        av=(av_c[0] if av_c else {}), banco_dados=(banco_c[0] if banco_c else {}),
+                        historico_lucros=historico_c,
+                    )
+                    sb_upsert("indice_boa_empresa", {
+                        "empresa_id": eid, "data_calculo": date.today().isoformat(),
+                        "nota_valuation": resultado_c["nota_valuation"],
+                        "nota_qualidade_financeira": resultado_c["nota_qualidade_financeira"],
+                        "nota_qualidade_negocio": resultado_c["nota_qualidade_negocio"],
+                        "nota_rating": resultado_c["nota_rating"],
+                        "nota_final": resultado_c["nota_final"],
+                        "classificacao": resultado_c["classificacao"],
+                        "detalhes": resultado_c["detalhes"],
+                    })
+                except Exception as e:
+                    erros.append(f"{row['ticker']}: {e}")
+                progresso.progress((i + 1) / total, text=f"{i+1}/{total} — {row['ticker']}")
+            progresso.empty()
+            if erros:
+                st.warning("Algumas empresas não puderam ser calculadas (dado faltando não trava as demais):\n\n"
+                           + "\n".join(f"- {e}" for e in erros))
+            st.success("Recálculo concluído.")
+
+        linhas = []
+        for _, row in df_todas.iterrows():
+            eid = int(row["id"])
+            ult = sb_select("indice_boa_empresa", "*", filtros={"empresa_id": eid}, ordem="data_calculo")
+            if ult:
+                u = ult[-1]
+                linhas.append({
+                    "Ticker": row["ticker"], "Empresa": row["razao_social"],
+                    "Nota Final": u["nota_final"], "Classificação": u["classificacao"],
+                    "Valuation/Rating": u["nota_rating"] if u["nota_rating"] is not None else u["nota_valuation"],
+                    "Qualid. Financeira": u["nota_qualidade_financeira"],
+                    "Qualid. Negócio": u["nota_qualidade_negocio"],
+                    "Calculado em": u["data_calculo"],
+                })
+            else:
+                linhas.append({
+                    "Ticker": row["ticker"], "Empresa": row["razao_social"],
+                    "Nota Final": None, "Classificação": "Não calculado",
+                    "Valuation/Rating": None, "Qualid. Financeira": None, "Qualid. Negócio": None,
+                    "Calculado em": None,
+                })
+
+        df_ibe = pd.DataFrame(linhas)
+        df_ibe = df_ibe[df_ibe["Classificação"].isin(classes_filtro)]
+        df_ibe = df_ibe.sort_values("Nota Final", ascending=False, na_position="last")
+        st.dataframe(df_ibe, use_container_width=True, hide_index=True)
+        st.caption("Para calcular uma empresa específica com o detalhamento completo, use a Etapa 4 do "
+                   "'🧭 Fluxo de Análise (guiado)'.")
 
 # ================================================================
 elif pagina == "6. Carteira":
