@@ -1,5 +1,16 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
+
+VERSÃO DESTE ARQUIVO: v1.1
+GERADO EM: 2026-07-02 03:45 (horário de geração pelo assistente)
+ÚLTIMA MUDANÇA: Adicionado cabeçalho de versão/data para controle de cópia.
+
+HISTÓRICO:
+- v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
+  cotação em tempo real via yfinance, cadastro/edição de empresa com rating e
+  dados de banco, Índice de Boa Empresa (cálculo + tela de screening).
+- v1.1 (2026-07-02): Cabeçalho de versão adicionado.
+
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
 """
