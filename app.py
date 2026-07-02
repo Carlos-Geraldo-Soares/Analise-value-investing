@@ -1,9 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v1.4
-GERADO EM: 2026-07-02 05:35 (horário de geração pelo assistente)
-ÚLTIMA MUDANÇA: Bug do Rating REALMENTE corrigido — causa raiz confirmada.
+VERSÃO DESTE ARQUIVO: v1.6
+GERADO EM: 2026-07-02 17:46 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Balanço/DRE agora busca do Fundamentus primeiro (Yahoo
+Finance frequentemente não tem dados completos pra ações brasileiras).
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -35,6 +36,24 @@ HISTÓRICO:
   Rating estava tentando INSERIR uma linha nova (sem razao_social) em vez de
   ATUALIZAR a empresa existente. Troquei para sb_update por id (mesmo padrão
   já usado com sucesso no formulário principal). Ponto corrigido e validado.
+- v1.5 (2026-07-02): Corrigido o motivo de "salvou mas não apareceu mensagem
+  nenhuma" — o st.success()/st.error() era chamado logo antes de um
+  st.rerun(), e o rerun recarregava a página rápido demais pra mensagem
+  chegar a ser desenhada na tela. Agora a mensagem também é guardada em
+  st.session_state e reexibida no topo da página assim que ela recarrega,
+  então ela sempre aparece de fato. Também: a partir de agora a data/hora
+  deste cabeçalho vem do relógio real no momento da geração, não é mais
+  digitada à mão.
+- v1.6 (2026-07-02): Comparando Fundamentus/Status Invest vs Yahoo Finance
+  pra B3SA3, confirmado que o Yahoo Finance não tem balanço/DRE completo
+  pra várias ações brasileiras ("Não encontrou dados de balanço recentes").
+  Criada _buscar_fundamentus_detalhes() (raspa a página individual do papel
+  no Fundamentus — mesma fonte já usada e comprovada no Screening) como
+  fonte PRINCIPAL de balanço/DRE, com Yahoo Finance como reserva só se o
+  Fundamentus não tiver a ação. Aplicado nos dois botões que buscam balanço
+  automaticamente (Fluxo Guiado Etapa 1, e "Atualizar" na tela de Empresas).
+  A fonte real (Fundamentus ou Yahoo Finance) agora aparece na mensagem de
+  confirmação e fica registrada na coluna 'fonte'.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -58,6 +77,16 @@ if not tela_login():
 # ---------- SIDEBAR ----------
 barra_usuario()
 st.sidebar.title("📈 Value Investing")
+
+# Mostra a confirmação de uma gravação feita no ciclo anterior (antes do
+# st.rerun() que trouxe a página até aqui) — sem isso, a mensagem de sucesso
+# ou erro nunca chegaria a aparecer na tela.
+if "_flash" in st.session_state:
+    _tipo_flash, _msg_flash = st.session_state.pop("_flash")
+    if _tipo_flash == "success":
+        st.success(_msg_flash)
+    else:
+        st.error(_msg_flash)
 pagina = st.sidebar.radio("Navegação", [
     "0. Screening de Ações",
     "0b. Minha Lista de Análise",
@@ -189,6 +218,113 @@ def _buscar_fundamentus_bruto():
 
     resultado.reset_index(drop=True, inplace=True)
     return resultado, colunas_ausentes
+
+
+def _buscar_fundamentus_detalhes(ticker):
+    """
+    Busca a página de detalhes de UM papel no Fundamentus
+    (fundamentus.com.br/detalhes.php?papel=XXXX3) — muito mais completa e
+    estável para ações brasileiras do que o Yahoo Finance, que frequentemente
+    não tem balanço/DRE completo pra B3.
+    Retorna um dict no formato da tabela balancos_dre, ou None se não achar
+    dados úteis pra esse ticker.
+    """
+    url = f"https://www.fundamentus.com.br/detalhes.php?papel={ticker.upper()}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+    }
+    resp = requests.get(url, headers=headers, timeout=25)
+    resp.encoding = "iso-8859-1"
+
+    tabelas = pd.read_html(io.StringIO(resp.text), decimal=",", thousands=".")
+    pares = {}
+    for t in tabelas:
+        n_cols = t.shape[1]
+        if n_cols < 2 or n_cols % 2 != 0:
+            continue
+        for _, row in t.iterrows():
+            for i in range(0, n_cols, 2):
+                chave = _normalizar_nome_coluna(str(row.iloc[i]))
+                valor = row.iloc[i + 1]
+                if chave and chave not in pares:
+                    pares[chave] = valor
+
+    def _num(*chaves):
+        for c in chaves:
+            if c in pares:
+                v = pares[c]
+                if isinstance(v, str):
+                    v = v.replace("%", "").replace(".", "").replace(",", ".")
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    data_ref_raw = None
+    for c in ["ult_balanco_processado", "ultimo_balanco_processado", "balanco_processado"]:
+        if c in pares:
+            data_ref_raw = str(pares[c])
+            break
+
+    data_ref = None
+    if data_ref_raw:
+        try:
+            d, m, a = data_ref_raw.strip().split("/")
+            data_ref = f"{a}-{m}-{d}"
+        except Exception:
+            data_ref = None
+
+    ativo = _num("ativo")
+    ativo_circulante = _num("ativo_circulante")
+    div_bruta = _num("div_bruta")
+    div_liquida = _num("div_liquida")
+    patrim_liq = _num("patrim_liq")
+    receita_liq = _num("receita_liquida")
+    ebit = _num("ebit")
+    lucro_liquido = _num("lucro_liquido")
+    cotacao = _num("cotacao")
+    nro_acoes = _num("nro_acoes")
+
+    if not data_ref and ativo is None:
+        return None  # ticker provavelmente não existe no Fundamentus
+
+    total_liabilities = (ativo - patrim_liq) if (ativo is not None and patrim_liq is not None) else None
+
+    return {
+        "data_referencia": data_ref or date.today().isoformat(),
+        "total_assets": ativo,
+        "total_liabilities": total_liabilities,
+        "total_equity": patrim_liq,
+        "net_debt": div_liquida,
+        "share_issued": nro_acoes,
+        "preco_mercado_referencia": cotacao,
+        "total_revenue": receita_liq,
+        "net_income": lucro_liquido,
+        "ebit": ebit,
+        "fonte": "Fundamentus",
+    }
+
+
+def buscar_balanco_multi_fonte(ticker):
+    """
+    Tenta o Fundamentus primeiro (mais completo/estável pra ações
+    brasileiras) e só cai pro Yahoo Finance se o Fundamentus não retornar
+    nada útil pra esse ticker. Nunca estoura erro — na pior das hipóteses
+    devolve um dict vazio (o chamador já trata isso mostrando um aviso).
+    """
+    try:
+        dados = _buscar_fundamentus_detalhes(ticker)
+        if dados and (dados.get("total_assets") or dados.get("net_income")):
+            return dados
+    except Exception:
+        pass
+    try:
+        return calc.buscar_balanco_yfinance(ticker) or {}
+    except Exception:
+        return {}
 
 
 def buscar_cotacao_tempo_real(ticker):
@@ -549,6 +685,10 @@ def gravar_com_confirmacao(func, *args, msg_ok="✅ Atualização com sucesso.",
     Executa uma gravação no banco (sb_insert/sb_upsert/sb_update/sb_delete) e
     SEMPRE mostra na tela se funcionou ou não — nunca fica em silêncio nem
     finge sucesso quando o banco não confirmou nada.
+    A mensagem é guardada em st.session_state["_flash"] e também mostrada na
+    hora — isso garante que ela sobreviva a um st.rerun() chamado logo em
+    seguida (sem isso, o rerun recarrega a página tão rápido que a mensagem
+    nunca chega a aparecer na tela).
     permitir_vazio=True: use para DELETE, que às vezes retorna lista vazia
     mesmo quando funcionou — nesse caso só uma exceção real conta como erro.
     Devolve o resultado pra quem chamou continuar usando (ex: pegar o id
@@ -557,12 +697,17 @@ def gravar_com_confirmacao(func, *args, msg_ok="✅ Atualização com sucesso.",
     try:
         resultado = func(*args, **kwargs)
     except Exception as e:
-        st.error(f"{msg_erro} Detalhe técnico: {e}")
+        msg = f"{msg_erro} Detalhe técnico: {e}"
+        st.session_state["_flash"] = ("error", msg)
+        st.error(msg)
         return None
     if not permitir_vazio and (resultado is None or resultado == [] or resultado == {} or resultado is False):
-        st.error(f"{msg_erro} (o banco não confirmou a gravação — confira os campos "
-                 "obrigatórios e as permissões de escrita desta tabela)")
+        msg = (f"{msg_erro} (o banco não confirmou a gravação — confira os campos "
+               "obrigatórios e as permissões de escrita desta tabela)")
+        st.session_state["_flash"] = ("error", msg)
+        st.error(msg)
         return None
+    st.session_state["_flash"] = ("success", msg_ok)
     st.success(msg_ok)
     return resultado if resultado not in (None, [], {}, False) else True
 
@@ -830,24 +975,27 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                 if bals:
                     st.success(f"✅ Balanço já existe: {', '.join([b['data_referencia'] for b in bals])}. Pode avançar ou buscar dados mais recentes.")
 
-                st.subheader("🌐 Buscar balanço automaticamente (Yahoo Finance)")
-                st.caption("Clique para buscar os dados mais recentes do balanço e DRE diretamente do Yahoo Finance.")
+                st.subheader("🌐 Buscar balanço automaticamente (Fundamentus, com Yahoo Finance de reserva)")
+                st.caption("Clique para buscar os dados mais recentes do balanço e DRE — tenta o Fundamentus "
+                           "primeiro (mais completo para ações brasileiras) e só usa o Yahoo Finance se necessário.")
                 if st.button("🔄 Buscar balanço automático agora", type="primary"):
-                    with st.spinner(f"Buscando dados de {emp['ticker']} no Yahoo Finance..."):
+                    with st.spinner(f"Buscando dados de {emp['ticker']}..."):
                         try:
-                            dados = calc.buscar_balanco_yfinance(emp["ticker"])
+                            dados = buscar_balanco_multi_fonte(emp["ticker"])
                             if dados.get("data_referencia"):
                                 dados["empresa_id"] = emp_id
                                 r = gravar_com_confirmacao(sb_upsert, "balancos_dre",
                                     {k:v for k,v in dados.items() if v is not None},
-                                    msg_ok=f"✅ Balanço de {dados['data_referencia']} importado e salvo com sucesso.",
+                                    msg_ok=f"✅ Balanço de {dados['data_referencia']} importado da fonte "
+                                           f"{dados.get('fonte','desconhecida')} e salvo com sucesso.",
                                     msg_erro="❌ Não foi possível salvar o balanço buscado.")
                                 if r:
                                     st.rerun()
                             else:
-                                st.warning("Dados encontrados mas sem data de referência. Use o lançamento manual.")
+                                st.warning("Não encontrou dados de balanço nem no Fundamentus nem no Yahoo "
+                                           "Finance para este ticker. Use o lançamento manual.")
                         except Exception as e:
-                            st.error(f"Erro ao buscar no Yahoo Finance: {e}")
+                            st.error(f"Erro ao buscar balanço: {e}")
                             st.info("Verifique se o ticker está correto (ex.: TRIS3, B3SA3) e tente novamente.")
 
                 st.markdown("---")
@@ -1267,12 +1415,13 @@ elif pagina == "1. Empresas e Setores":
                 st.caption("Nenhum indicador calculado ainda para esta empresa.")
             if st.button("🔄 Atualizar (buscar balanço mais recente e recalcular)"):
                 try:
-                    dados_bal = calc.buscar_balanco_yfinance(dados_atuais["ticker"])
+                    dados_bal = buscar_balanco_multi_fonte(dados_atuais["ticker"])
                     if dados_bal.get("data_referencia"):
+                        fonte_dados = dados_bal.get("fonte", "desconhecida")
                         dados_bal["empresa_id"] = empresa_id_edicao
                         r_bal = gravar_com_confirmacao(sb_upsert, "balancos_dre",
                             {k:v for k,v in dados_bal.items() if v is not None},
-                            msg_ok=f"✅ Balanço de {dados_bal['data_referencia']} salvo.",
+                            msg_ok=f"✅ Balanço de {dados_bal['data_referencia']} salvo (fonte: {fonte_dados}).",
                             msg_erro="❌ Não foi possível salvar o balanço buscado.")
                         if r_bal:
                             ind_novo = calc.calcular_indicadores(dados_bal)
@@ -1284,7 +1433,7 @@ elif pagina == "1. Empresas e Setores":
                                         res = sb_upsert("indicadores_calculados", {
                                             "empresa_id": empresa_id_edicao, "data_referencia": dados_bal["data_referencia"],
                                             "indicador_id": match["id"], "valor": valor,
-                                            "fonte": "Yahoo Finance", "atualizado_em": pd.Timestamp.now().isoformat(),
+                                            "fonte": fonte_dados, "atualizado_em": pd.Timestamp.now().isoformat(),
                                         })
                                         ok_count += 1 if res else 0
                                         falha_count += 0 if res else 1
@@ -1292,7 +1441,7 @@ elif pagina == "1. Empresas e Setores":
                                         falha_count += 1
                             if falha_count == 0 and ok_count > 0:
                                 st.success(f"✅ {ok_count} indicador(es) atualizado(s) com sucesso "
-                                           f"(fonte: Yahoo Finance, data: {dados_bal['data_referencia']}).")
+                                           f"(fonte: {fonte_dados}, data: {dados_bal['data_referencia']}).")
                                 st.rerun()
                             elif ok_count > 0:
                                 st.warning(f"⚠️ {ok_count} atualizado(s), mas {falha_count} falharam.")
