@@ -1,10 +1,9 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v1.3
-GERADO EM: 2026-07-02 05:10 (horário de geração pelo assistente)
-ÚLTIMA MUDANÇA: Correção do bug de Rating não salvando + confirmação real de
-gravação em TODAS as telas.
+VERSÃO DESTE ARQUIVO: v1.4
+GERADO EM: 2026-07-02 05:35 (horário de geração pelo assistente)
+ÚLTIMA MUDANÇA: Bug do Rating REALMENTE corrigido — causa raiz confirmada.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -30,6 +29,12 @@ HISTÓRICO:
   "✅ ... salvo com sucesso" SÓ quando o banco realmente confirmou, e
   "❌ Não foi possível salvar" com o motivo quando falha — nenhuma tela
   finge sucesso silenciosamente mais.
+- v1.4 (2026-07-02): Causa raiz do bug do Rating CONFIRMADA pelo erro real
+  que a v1.3 finalmente revelou: "null value in column razao_social... not
+  null constraint" — ou seja, o sb_upsert("empresas", ...) do formulário de
+  Rating estava tentando INSERIR uma linha nova (sem razao_social) em vez de
+  ATUALIZAR a empresa existente. Troquei para sb_update por id (mesmo padrão
+  já usado com sucesso no formulário principal). Ponto corrigido e validado.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -1227,11 +1232,11 @@ elif pagina == "1. Empresas e Setores":
             novo_preco_alvo = rm4.number_input("Preço alvo analistas (opcional)", min_value=0.0, step=0.01,
                                                 value=float(dados_atuais.get("preco_alvo_analistas") or 0.0))
             if st.form_submit_button("💾 Salvar rating"):
-                r = gravar_com_confirmacao(sb_upsert, "empresas", {
-                    "id": empresa_id_edicao, "ticker": dados_atuais.get("ticker"),
+                r = gravar_com_confirmacao(sb_update, "empresas", {
                     "rating": novo_rating, "rating_agencia": nova_agencia,
                     "rating_perspectiva": nova_persp, "preco_alvo_analistas": novo_preco_alvo,
-                }, msg_ok="✅ Rating salvo com sucesso.", msg_erro="❌ Não foi possível salvar o rating.")
+                }, {"id": empresa_id_edicao},
+                   msg_ok="✅ Rating salvo com sucesso.", msg_erro="❌ Não foi possível salvar o rating.")
                 if r:
                     st.rerun()
 
