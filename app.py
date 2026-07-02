@@ -1,10 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v1.6
-GERADO EM: 2026-07-02 17:46 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Balanço/DRE agora busca do Fundamentus primeiro (Yahoo
-Finance frequentemente não tem dados completos pra ações brasileiras).
+VERSÃO DESTE ARQUIVO: v1.7
+GERADO EM: 2026-07-02 17:51 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Cotação automática (equivalente ao GOOGLEFINANCE) conectada
+na tela de Carteira, com data e hora completas.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -54,6 +54,14 @@ HISTÓRICO:
   automaticamente (Fluxo Guiado Etapa 1, e "Atualizar" na tela de Empresas).
   A fonte real (Fundamentus ou Yahoo Finance) agora aparece na mensagem de
   confirmação e fica registrada na coluna 'fonte'.
+- v1.7 (2026-07-02): buscar_cotacao_tempo_real() agora também aceita índices
+  (IBOV, S&P500 etc — equivalente ao =GOOGLEFINANCE("INDEXBVMF:IBOV") do
+  Google Sheets) e devolve (preço, data_hora). Conectada na tela de Carteira:
+  botão "🔄 Buscar cotações automáticas agora (todas)" busca o preço de
+  todas as ações da carteira de uma vez e grava com data E hora completas
+  (antes só gravava a data). O ajuste manual continua disponível como
+  reserva/correção, mostrando quando cada preço foi atualizado pela última
+  vez.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -327,24 +335,44 @@ def buscar_balanco_multi_fonte(ticker):
         return {}
 
 
+# índices que não seguem o padrão "TICKER.SA" — mapeados pro código do Yahoo Finance
+_MAPA_INDICES_YF = {
+    "IBOV": "^BVSP", "IBOVESPA": "^BVSP", "INDEXBVMF:IBOV": "^BVSP",
+    "SP500": "^GSPC", "S&P500": "^GSPC", "DOW": "^DJI", "NASDAQ": "^IXIC",
+    "IFIX": "^IFIX.SA",
+}
+
+
 def buscar_cotacao_tempo_real(ticker):
     """
     Cotação em tempo real (na prática, ~15 min de atraso — padrão do Yahoo
-    Finance para a B3) via yfinance. Retorna 0.0 se não conseguir; nunca
-    estoura erro pra tela.
-    Uso recomendado: 1 ação por vez (relatório da ação / fluxo guiado). Não
-    usar para a lista inteira da B3 no screening — seria lento e a B3/Yahoo
-    limitam requisições em massa. O screening usa os múltiplos do próprio
-    Fundamentus (P/L, P/VP etc.), que já embutem o preço.
+    Finance para a B3) via yfinance. É o equivalente ao GOOGLEFINANCE() do
+    Google Sheets, mas chamável de dentro do Python. Aceita tanto ações
+    (ex: PETR4) quanto índices (ex: IBOV, equivalente ao
+    =GOOGLEFINANCE("INDEXBVMF:IBOV") do Sheets).
+    Retorna (preco, timestamp_iso) — preco é 0.0 se não conseguir buscar;
+    nunca estoura erro pra tela.
+    Uso recomendado: 1 ativo por vez (relatório da ação, carteira, fluxo
+    guiado). Não usar para a lista inteira da B3 no screening — seria lento
+    e a B3/Yahoo limitam requisições em massa.
     """
     try:
         import yfinance as yf
-        tk = ticker if ticker.upper().endswith(".SA") else f"{ticker.upper()}.SA"
+        t = ticker.strip().upper()
+        if t in _MAPA_INDICES_YF:
+            tk = _MAPA_INDICES_YF[t]
+        elif t.startswith("^"):
+            tk = t
+        elif t.endswith(".SA"):
+            tk = t
+        else:
+            tk = f"{t}.SA"
         info = yf.Ticker(tk).fast_info
         preco = info.get("last_price") or info.get("lastPrice") or 0.0
-        return float(preco) if preco else 0.0
+        agora = pd.Timestamp.now().isoformat()
+        return (float(preco) if preco else 0.0), agora
     except Exception:
-        return 0.0
+        return 0.0, pd.Timestamp.now().isoformat()
 
 
 # ---------- ÍNDICE DE BOA EMPRESA ----------
@@ -1695,13 +1723,49 @@ elif pagina == "6. Carteira":
                 with st.expander("✏️ Atualizar preço atual das ações"):
                     emps_c = sb_select("empresas","id,ticker")
                     emps_map = {e["id"]:e["ticker"] for e in emps_c if e["id"] in eids}
+
+                    if st.button("🔄 Buscar cotações automáticas agora (todas)"):
+                        ok_count, falha_count = 0, 0
+                        with st.spinner("Buscando cotações no Yahoo Finance..."):
+                            for eid, tk in emps_map.items():
+                                preco, agora = buscar_cotacao_tempo_real(tk)
+                                if preco > 0:
+                                    res = sb_upsert("cotacao_atual_manual", {
+                                        "carteira_id": cart_id, "empresa_id": eid,
+                                        "preco_atual": preco, "data_atualizacao": agora,
+                                    })
+                                    ok_count += 1 if res else 0
+                                    falha_count += 0 if res else 1
+                                else:
+                                    falha_count += 1
+                        if ok_count > 0:
+                            st.success(f"✅ {ok_count} cotação(ões) atualizada(s) com sucesso "
+                                       f"({pd.Timestamp.now().strftime('%d/%m/%Y %H:%M')}).")
+                        if falha_count > 0:
+                            st.warning(f"⚠️ {falha_count} ticker(s) não retornaram cotação (verifique se o "
+                                       "código está correto ou tente novamente em alguns minutos).")
+                        if ok_count > 0:
+                            st.rerun()
+
+                    st.caption("Ou ajuste manualmente uma ação específica:")
                     cols = st.columns(4)
                     for i,(eid,tk) in enumerate(emps_map.items()):
-                        atual_r = sb_select("cotacao_atual_manual","preco_atual",filtros={"carteira_id":cart_id,"empresa_id":eid})
+                        atual_r = sb_select("cotacao_atual_manual","preco_atual,data_atualizacao",filtros={"carteira_id":cart_id,"empresa_id":eid})
                         v0 = float(atual_r[0]["preco_atual"]) if atual_r else 0.0
-                        novo = cols[i%4].number_input(tk,value=v0,key=f"p_{eid}")
-                        if novo>0:
-                            sb_upsert("cotacao_atual_manual",{"carteira_id":cart_id,"empresa_id":eid,"preco_atual":novo,"data_atualizacao":date.today().isoformat()})
+                        label = tk
+                        if atual_r and atual_r[0].get("data_atualizacao"):
+                            try:
+                                dt_fmt = pd.Timestamp(atual_r[0]["data_atualizacao"]).strftime("%d/%m %H:%M")
+                                label = f"{tk} (atualizado {dt_fmt})"
+                            except Exception:
+                                pass
+                        novo = cols[i%4].number_input(label,value=v0,key=f"p_{eid}")
+                        if novo>0 and novo != v0:
+                            r_cot = gravar_com_confirmacao(sb_upsert, "cotacao_atual_manual",
+                                {"carteira_id":cart_id,"empresa_id":eid,"preco_atual":novo,
+                                 "data_atualizacao":pd.Timestamp.now().isoformat()},
+                                msg_ok=f"✅ Preço de {tk} atualizado manualmente.",
+                                msg_erro=f"❌ Não foi possível salvar o preço de {tk}.")
                 linhas = []
                 for eid in eids:
                     tk_r = sb_select("empresas","ticker,razao_social",filtros={"id":eid})
