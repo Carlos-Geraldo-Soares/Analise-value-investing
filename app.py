@@ -1,10 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v2.6
-GERADO EM: 2026-07-03 04:15 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Corrigido erro "duplicate key" ao buscar balanço de uma
-data que já existia — mesmo bug do Rating, agora em balancos_dre.
+VERSÃO DESTE ARQUIVO: v2.7
+GERADO EM: 2026-07-03 12:38 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Todos os valores exibidos agora usam formato brasileiro
+(ponto no milhar, vírgula no decimal) com R$ pra dinheiro e % pra
+percentual.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -155,6 +156,20 @@ HISTÓRICO:
   na Etapa 1, formulário manual, botão Atualizar na tela de Empresas).
   Também corrigido "fonte: None" aparecendo literalmente na tela quando o
   balanço não tinha fonte registrada — agora mostra "—".
+- v2.7 (2026-07-03): Corrigido formato numérico — o app mostrava valores no
+  padrão americano (vírgula no milhar, ponto no decimal: 48,487,647.00) em
+  vez do brasileiro (48.487.647,00). Criada formatar_br(valor, tipo) —
+  testada e confirmada contra os valores exatos do print do usuário — e
+  aplicada em todo lugar onde um valor é só EXIBIDO (nunca editado): Etapa
+  1 (resumo do balanço), Etapa 2 (Graham/FCD/margem), Relatório Final,
+  Carteira (totais e operações), Relatório da Ação (balanço e VI) e
+  cotações de mercado (Ibovespa/Dólar/S&P500). Money agora sempre com
+  "R$", percentual sempre com "%", e número puro nos demais casos.
+  IMPORTANTE: os campos que você EDITA (formulários com number_input, como
+  o de balanço manual) continuam sem separador de milhar enquanto digita —
+  isso é uma limitação do próprio campo numérico do navegador, não dá pra
+  contornar sem trocar o tipo de campo (perderia as setas +/- e a
+  validação de número).
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -655,6 +670,28 @@ _MAPA_INDICES_YF = {
     "DOLAR": "BRL=X", "DÓLAR": "BRL=X", "USD": "BRL=X", "USDBRL": "BRL=X",
     "USDBRL=X": "BRL=X", "EUR": "EURBRL=X",
 }
+
+
+def formatar_br(valor, tipo="numero", casas=2):
+    """
+    Formata um número no padrão brasileiro: milhar com ponto, decimal com
+    vírgula (ex.: 48.487.647,00) — o padrão americano usa o contrário.
+    tipo: 'moeda' (prefixo R$), 'percentual' (sufixo %), 'numero' (nenhum).
+    Sempre retorna texto; nunca estoura erro (valor ausente vira "—").
+    """
+    if valor is None:
+        return "—"
+    try:
+        valor = float(valor)
+    except (TypeError, ValueError):
+        return str(valor)
+    texto = f"{valor:,.{casas}f}"
+    texto = texto.replace(",", "_").replace(".", ",").replace("_", ".")
+    if tipo == "moeda":
+        return f"R$ {texto}"
+    if tipo == "percentual":
+        return f"{texto}%"
+    return texto
 
 
 def buscar_cotacao_tempo_real(ticker):
@@ -1398,14 +1435,14 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                     st.markdown(f"**Dados atuais do balanço mais recente ({ultimo_bal['data_referencia']}, "
                                 f"fonte: {ultimo_bal.get('fonte') or '—'}):**")
                     m1,m2,m3,m4 = st.columns(4)
-                    m1.metric("Ativo Total", f"{ultimo_bal.get('total_assets') or 0:,.0f}")
-                    m2.metric("Patrim. Líquido", f"{ultimo_bal.get('total_equity') or 0:,.0f}")
-                    m3.metric("Dívida Líquida", f"{ultimo_bal.get('net_debt') or 0:,.0f}")
-                    m4.metric("Preço mercado", f"R$ {ultimo_bal.get('preco_mercado_referencia') or 0:,.2f}")
+                    m1.metric("Ativo Total", formatar_br(ultimo_bal.get('total_assets'), "moeda"))
+                    m2.metric("Patrim. Líquido", formatar_br(ultimo_bal.get('total_equity'), "moeda"))
+                    m3.metric("Dívida Líquida", formatar_br(ultimo_bal.get('net_debt'), "moeda"))
+                    m4.metric("Preço mercado", formatar_br(ultimo_bal.get('preco_mercado_referencia'), "moeda"))
                     m5,m6,m7 = st.columns(3)
-                    m5.metric("Receita", f"{ultimo_bal.get('total_revenue') or 0:,.0f}")
-                    m6.metric("EBIT", f"{ultimo_bal.get('ebit') or 0:,.0f}")
-                    m7.metric("Lucro Líquido", f"{ultimo_bal.get('net_income') or 0:,.0f}")
+                    m5.metric("Receita", formatar_br(ultimo_bal.get('total_revenue'), "moeda"))
+                    m6.metric("EBIT", formatar_br(ultimo_bal.get('ebit'), "moeda"))
+                    m7.metric("Lucro Líquido", formatar_br(ultimo_bal.get('net_income'), "moeda"))
                     if not any([ultimo_bal.get('total_assets'), ultimo_bal.get('net_income')]):
                         st.warning("⚠️ Esse balanço existe no banco mas está com os valores principais vazios "
                                    "(provavelmente uma busca anterior não trouxe dados completos). Clique em "
@@ -1514,10 +1551,10 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                         bal, g_pct=g, cdi_pct=cdi_anual, selic_pct=selic_anual, anos_fcd=5, g_terminal_pct=3.0)
 
                     r1,r2,r3,r4 = st.columns(4)
-                    r1.metric("Graham Simplif.", f"R$ {resultado_vi['vi_simplificado']:.2f}" if resultado_vi['vi_simplificado'] else "—")
-                    r2.metric("Número Graham",   f"R$ {resultado_vi['vi_numero_graham']:.2f}" if resultado_vi['vi_numero_graham'] else "—")
-                    r3.metric("Graham Complexo", f"R$ {resultado_vi['vi_complexo']:.2f}" if resultado_vi['vi_complexo'] else "—")
-                    r4.metric("FCD",             f"R$ {resultado_vi['vi_fcd']:.2f}" if resultado_vi['vi_fcd'] else "—")
+                    r1.metric("Graham Simplif.", formatar_br(resultado_vi['vi_simplificado'], "moeda") if resultado_vi['vi_simplificado'] else "—")
+                    r2.metric("Número Graham",   formatar_br(resultado_vi['vi_numero_graham'], "moeda") if resultado_vi['vi_numero_graham'] else "—")
+                    r3.metric("Graham Complexo", formatar_br(resultado_vi['vi_complexo'], "moeda") if resultado_vi['vi_complexo'] else "—")
+                    r4.metric("FCD",             formatar_br(resultado_vi['vi_fcd'], "moeda") if resultado_vi['vi_fcd'] else "—")
 
                     preco = resultado_vi['preco_mercado']
                     vi_medio = resultado_vi['vi_medio']
@@ -1525,7 +1562,8 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                     classe = resultado_vi['classificacao']
                     if preco and vi_medio:
                         cor = "green" if classe=="Comprar" else ("orange" if classe=="Observar" else "red")
-                        st.markdown(f"**Preço:** R$ {preco:.2f} | **VI médio:** R$ {vi_medio:.2f} | **Margem:** {margem:.1f}% | **:{cor}[{classe}]**")
+                        st.markdown(f"**Preço:** {formatar_br(preco,'moeda')} | **VI médio:** {formatar_br(vi_medio,'moeda')} | "
+                                    f"**Margem:** {formatar_br(margem,'percentual',1)} | **:{cor}[{classe}]**")
 
                     with st.expander("Ver premissas e detalhe do FCD"):
                         st.json(resultado_vi['premissas'])
@@ -1577,7 +1615,7 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                     preco = bal.get("preco_mercado_referencia")
                     vis = sb_select("valor_intrinseco","metodo,valor",filtros={"empresa_id":emp_id,"data_referencia":bal["data_referencia"]})
                     st.markdown(f"#### {emp['ticker']} — {emp['razao_social']}")
-                    st.write(f"Preço de mercado: **R$ {preco:.2f}**" if preco else "Sem preço lançado.")
+                    st.write(f"Preço de mercado: **{formatar_br(preco,'moeda')}**" if preco else "Sem preço lançado.")
                     if vis:
                         df_vi = pd.DataFrame(vis)
                         st.dataframe(df_vi, use_container_width=True)
@@ -1585,7 +1623,8 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                         margem = calc.margem_seguranca(vi_medio, preco)
                         classe = calc.classificar(margem)
                         cor = "green" if classe=="Comprar" else ("orange" if classe=="Observar" else "red")
-                        st.markdown(f"**Valor intrínseco médio: R$ {vi_medio:.2f} | Margem: {margem:.1f}% | Classificação: :{cor}[{classe}]**")
+                        st.markdown(f"**Valor intrínseco médio: {formatar_br(vi_medio,'moeda')} | "
+                                    f"Margem: {formatar_br(margem,'percentual',1)} | Classificação: :{cor}[{classe}]**")
                     av = sb_select("avaliacao_qualitativa_buffett","*",filtros={"empresa_id":emp_id})
                     if av:
                         a = av[0]
@@ -2224,9 +2263,9 @@ elif pagina == "6. Carteira":
                     r_at = t_at - t_inv
                     ev_total = round(r_at/t_inv*100,2) if t_inv else None
                     c1,c2,c3,c4 = st.columns(4)
-                    c1.metric("Total Investido",f"R$ {t_inv:,.2f}")
-                    c2.metric("Total Atual",f"R$ {t_at:,.2f}")
-                    c3.metric("Resultado",f"R$ {r_at:,.2f}")
+                    c1.metric("Total Investido",formatar_br(t_inv,"moeda"))
+                    c2.metric("Total Atual",formatar_br(t_at,"moeda"))
+                    c3.metric("Resultado",formatar_br(r_at,"moeda"))
                     c4.metric("Evolução",f"{ev_total:.2f}%" if ev_total else "—")
                     st.markdown("---")
                     st.subheader("🧭 Analisar uma ação da carteira")
@@ -2246,7 +2285,7 @@ elif pagina == "6. Carteira":
                     preco_u = c4.number_input("Preço unitário",value=10.0)
                     taxas = st.number_input("Taxas",value=0.0)
                     tot = qtd*preco_u + (taxas if tipo=="compra" else -taxas)
-                    st.write(f"**Total da operação: R$ {tot:,.2f}**")
+                    st.write(f"**Total da operação: {formatar_br(tot,'moeda')}**")
                     if st.form_submit_button("Registrar operação"):
                         r = gravar_com_confirmacao(sb_insert, "movimentos_carteira",
                             {"carteira_id":cart_id,"empresa_id":int(empresa["id"]),"tipo":tipo,"data":data_m,
@@ -2344,14 +2383,14 @@ elif pagina == "7. Relatório da Ação":
             bal_rel = bals_rel[-1]
             st.subheader(f"📊 Balanço / DRE (referência: {bal_rel['data_referencia']}, fonte: {bal_rel.get('fonte','—')})")
             r1,r2,r3,r4 = st.columns(4)
-            r1.metric("Ativo Total", f"R$ {bal_rel.get('total_assets',0):,.0f}" if bal_rel.get("total_assets") else "—")
-            r2.metric("Patrimônio Líq.", f"R$ {bal_rel.get('total_equity',0):,.0f}" if bal_rel.get("total_equity") else "—")
-            r3.metric("Dívida Líquida", f"R$ {bal_rel.get('net_debt',0):,.0f}" if bal_rel.get("net_debt") is not None else "—")
-            r4.metric("Preço de mercado", f"R$ {bal_rel.get('preco_mercado_referencia',0):,.2f}" if bal_rel.get("preco_mercado_referencia") else "—")
+            r1.metric("Ativo Total", formatar_br(bal_rel.get('total_assets'), "moeda"))
+            r2.metric("Patrimônio Líq.", formatar_br(bal_rel.get('total_equity'), "moeda"))
+            r3.metric("Dívida Líquida", formatar_br(bal_rel.get('net_debt'), "moeda"))
+            r4.metric("Preço de mercado", formatar_br(bal_rel.get('preco_mercado_referencia'), "moeda"))
             r5,r6,r7 = st.columns(3)
-            r5.metric("Receita (12m)", f"R$ {bal_rel.get('total_revenue',0):,.0f}" if bal_rel.get("total_revenue") else "—")
-            r6.metric("EBIT (12m)", f"R$ {bal_rel.get('ebit',0):,.0f}" if bal_rel.get("ebit") else "—")
-            r7.metric("Lucro Líquido (12m)", f"R$ {bal_rel.get('net_income',0):,.0f}" if bal_rel.get("net_income") else "—")
+            r5.metric("Receita (12m)", formatar_br(bal_rel.get('total_revenue'), "moeda"))
+            r6.metric("EBIT (12m)", formatar_br(bal_rel.get('ebit'), "moeda"))
+            r7.metric("Lucro Líquido (12m)", formatar_br(bal_rel.get('net_income'), "moeda"))
 
             st.markdown("---")
             st.subheader("📈 Indicadores fundamentalistas")
@@ -2377,7 +2416,8 @@ elif pagina == "7. Relatório da Ação":
                     margem_rel = calc.margem_seguranca(vi_medio_rel, preco_rel)
                     classe_rel = calc.classificar(margem_rel)
                     cor_rel = "green" if classe_rel=="Comprar" else ("orange" if classe_rel=="Observar" else "red")
-                    st.markdown(f"**VI médio: R$ {vi_medio_rel:.2f} | Margem: {margem_rel:.1f}% | :{cor_rel}[{classe_rel}]**")
+                    st.markdown(f"**VI médio: {formatar_br(vi_medio_rel,'moeda')} | "
+                                f"Margem: {formatar_br(margem_rel,'percentual',1)} | :{cor_rel}[{classe_rel}]**")
             else:
                 st.caption("Valor intrínseco ainda não calculado — use a Etapa 2 do Fluxo Guiado.")
 
@@ -2424,9 +2464,9 @@ elif pagina == "8. Informações Relevantes":
         dolar_preco, dolar_hora = buscar_cotacao_tempo_real("USDBRL=X")
         sp500_preco, sp500_hora = buscar_cotacao_tempo_real("SP500")
     q1, q2, q3 = st.columns(3)
-    q1.metric("Ibovespa", f"{ibov_preco:,.0f} pts" if ibov_preco else "—")
-    q2.metric("Dólar (USD/BRL)", f"R$ {dolar_preco:,.2f}" if dolar_preco else "—")
-    q3.metric("S&P 500", f"{sp500_preco:,.0f} pts" if sp500_preco else "—")
+    q1.metric("Ibovespa", f"{formatar_br(ibov_preco,'numero',0)} pts" if ibov_preco else "—")
+    q2.metric("Dólar (USD/BRL)", formatar_br(dolar_preco,"moeda") if dolar_preco else "—")
+    q3.metric("S&P 500", f"{formatar_br(sp500_preco,'numero',0)} pts" if sp500_preco else "—")
     st.caption(f"Atualizado em {pd.Timestamp.now().strftime('%d/%m/%Y %H:%M')} "
                "(~15 min de atraso, padrão do Yahoo Finance).")
 
