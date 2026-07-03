@@ -1,11 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v2.7
-GERADO EM: 2026-07-03 12:38 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Todos os valores exibidos agora usam formato brasileiro
-(ponto no milhar, vírgula no decimal) com R$ pra dinheiro e % pra
-percentual.
+VERSÃO DESTE ARQUIVO: v3.0
+GERADO EM: 2026-07-03 12:59 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Etapa 3 ganhou campos analíticos (Score Value Investing,
+pontos positivos/atenção, vantagens, riscos, nota de qualidade); Relatório
+da Ação agora exporta em PDF. REQUER reportlab no requirements.txt.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -170,6 +170,25 @@ HISTÓRICO:
   isso é uma limitação do próprio campo numérico do navegador, não dá pra
   contornar sem trocar o tipo de campo (perderia as setas +/- e a
   validação de número).
+- v3.0 (2026-07-03): Implementada a estrutura analítica que o usuário pediu
+  inspirado no exemplo do MOAT (B3SA3/BBDC4/PETR4/VALE3) — SEM automação
+  por IA (decisão consciente do usuário por causa do custo de API), mas
+  pronta para quando ele decidir automatizar no futuro. Etapa 3 do Fluxo
+  Guiado ganhou: Nota de qualidade (0-10, com prévia de estrelas), Score
+  Value Investing (0-100), e 4 campos de texto livre (um item por linha)
+  — Pontos positivos, Pontos de atenção, Vantagens, Riscos — guardados
+  como listas (jsonb). Migração migration_complemento_v3.sql criada pra
+  essas colunas novas em avaliacao_qualitativa_buffett. O Relatório da
+  Ação agora exibe tudo isso, e ganhou um botão "📄 Gerar PDF deste
+  relatório" que monta um PDF completo (balanço, indicadores, valor
+  intrínseco, avaliação qualitativa, Índice de Boa Empresa, histórico) via
+  reportlab — testado e confirmado que os acentos em português renderizam
+  certinho. Também corrigidos preventivamente 2 pontos que usavam sb_upsert
+  em tabelas com chave única composta (indice_boa_empresa e o próprio save
+  da nova avaliação), aplicando o mesmo padrão seguro de "verifica se
+  existe, UPDATE ou INSERT" já usado em balancos_dre e no Rating.
+  IMPORTANTE: adicionar "reportlab" ao requirements.txt, ou o botão de PDF
+  vai dar erro "No module named reportlab".
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -995,14 +1014,16 @@ def renderizar_diagnostico_boa_empresa(emp_id, emp, permitir_salvar=True):
     """
     Busca tudo que é preciso (balanço, indicadores, VI, avaliação qualitativa,
     dados de banco, histórico de lucros) e desenha o diagnóstico do Índice de
-    Boa Empresa na tela. Reaproveitado no Fluxo Guiado e na tela de Empresas.
+    Boa Empresa na tela. Reaproveitado no Fluxo Guiado, na tela de Empresas e
+    no Relatório da Ação (que também usa o valor de retorno pro PDF).
     Nunca estoura erro — se faltar balanço, avisa e para por aí.
+    Retorna o dict do resultado (ou None se não deu pra calcular).
     """
     bals = sb_select("balancos_dre", "*", filtros={"empresa_id": emp_id}, ordem="data_referencia")
     if not bals:
         st.warning("Sem balanço cadastrado para esta empresa ainda. "
                    "Lance um balanço (Fluxo de Análise guiado, Etapa 1) para calcular o diagnóstico.")
-        return
+        return None
     bal = bals[-1]
     ind = calc.calcular_indicadores(bal)
     preco = bal.get("preco_mercado_referencia")
@@ -1029,7 +1050,7 @@ def renderizar_diagnostico_boa_empresa(emp_id, emp, permitir_salvar=True):
     with st.expander("Ver detalhamento critério a critério (para validar)"):
         st.json(resultado["detalhes"])
     if permitir_salvar and st.button("💾 Salvar este diagnóstico", key=f"salvar_ibe_{emp_id}"):
-        gravar_com_confirmacao(sb_upsert, "indice_boa_empresa", {
+        payload_ibe = {
             "empresa_id": emp_id, "data_calculo": date.today().isoformat(),
             "nota_valuation": resultado["nota_valuation"],
             "nota_qualidade_financeira": resultado["nota_qualidade_financeira"],
@@ -1038,7 +1059,117 @@ def renderizar_diagnostico_boa_empresa(emp_id, emp, permitir_salvar=True):
             "nota_final": resultado["nota_final"],
             "classificacao": resultado["classificacao"],
             "detalhes": resultado["detalhes"],
-        }, msg_ok="✅ Diagnóstico salvo com sucesso.", msg_erro="❌ Não foi possível salvar o diagnóstico.")
+        }
+        existente_ibe = sb_select("indice_boa_empresa", "id",
+                                   filtros={"empresa_id": emp_id, "data_calculo": date.today().isoformat()})
+        if existente_ibe:
+            gravar_com_confirmacao(sb_update, "indice_boa_empresa", payload_ibe, {"id": existente_ibe[0]["id"]},
+                msg_ok="✅ Diagnóstico atualizado com sucesso.", msg_erro="❌ Não foi possível atualizar o diagnóstico.")
+        else:
+            gravar_com_confirmacao(sb_insert, "indice_boa_empresa", payload_ibe,
+                msg_ok="✅ Diagnóstico salvo com sucesso.", msg_erro="❌ Não foi possível salvar o diagnóstico.")
+
+    return resultado
+
+
+def gerar_pdf_relatorio_acao(emp, bal, inds_calc, inds_def, vis, av, ibe_resultado, historico):
+    """
+    Gera o Relatório da Ação em PDF, com as mesmas informações mostradas na
+    tela '7. Relatório da Ação'. Retorna os bytes do PDF, prontos pra usar
+    num st.download_button — nunca escreve em disco.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=1.5*cm, bottomMargin=1.5*cm)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(f"Relatório da Ação — {emp.get('ticker','')} — {emp.get('razao_social','')}", styles['Title']))
+    story.append(Paragraph(f"Gerado em {pd.Timestamp.now().strftime('%d/%m/%Y %H:%M')}", styles['Normal']))
+    story.append(Spacer(1, 14))
+
+    def _tabela(linhas, larguras, cabecalho=False):
+        t = Table(linhas, colWidths=larguras)
+        estilo = [("GRID", (0,0), (-1,-1), 0.5, colors.grey), ("FONTSIZE",(0,0),(-1,-1),9)]
+        if cabecalho:
+            estilo.append(("BACKGROUND", (0,0), (-1,0), colors.lightgrey))
+        t.setStyle(TableStyle(estilo))
+        story.append(t)
+        story.append(Spacer(1, 12))
+
+    if bal:
+        story.append(Paragraph(f"Balanço / DRE (ref: {bal.get('data_referencia','—')}, "
+                                f"fonte: {bal.get('fonte') or '—'})", styles['Heading2']))
+        _tabela([
+            ["Ativo Total", formatar_br(bal.get("total_assets"), "moeda")],
+            ["Patrimônio Líquido", formatar_br(bal.get("total_equity"), "moeda")],
+            ["Dívida Líquida", formatar_br(bal.get("net_debt"), "moeda")],
+            ["Preço de mercado", formatar_br(bal.get("preco_mercado_referencia"), "moeda")],
+            ["Receita (12m)", formatar_br(bal.get("total_revenue"), "moeda")],
+            ["EBIT (12m)", formatar_br(bal.get("ebit"), "moeda")],
+            ["Lucro Líquido (12m)", formatar_br(bal.get("net_income"), "moeda")],
+        ], [6*cm, 6*cm])
+
+    if inds_calc:
+        story.append(Paragraph("Indicadores fundamentalistas", styles['Heading2']))
+        linhas = [["Indicador", "Valor"]]
+        for ic in inds_calc:
+            nome_ind = next((d["nome"] for d in inds_def if d["id"] == ic.get("indicador_id")), f"#{ic.get('indicador_id')}")
+            linhas.append([nome_ind, formatar_br(ic.get("valor"))])
+        _tabela(linhas, [8*cm, 4*cm], cabecalho=True)
+
+    if vis:
+        story.append(Paragraph("Valor Intrínseco", styles['Heading2']))
+        linhas = [["Método", "Valor"]] + [[v.get("metodo",""), formatar_br(v.get("valor"), "moeda")] for v in vis]
+        _tabela(linhas, [8*cm, 4*cm], cabecalho=True)
+
+    if av:
+        story.append(Paragraph("Avaliação Qualitativa (Buffett)", styles['Heading2']))
+        linhas_av = [
+            ["Moat", av.get("moat") or "—"],
+            ["Qualidade da gestão", str(av.get("qualidade_gestao") or "—")],
+            ["Previsibilidade", av.get("previsibilidade") or "—"],
+            ["Círculo de competência", "Sim" if av.get("circulo_competencia") else "Não"],
+        ]
+        if av.get("nota_qualidade_10") is not None:
+            linhas_av.append(["Nota de qualidade", f"{formatar_br(av['nota_qualidade_10'],'numero',1)}/10"])
+        if av.get("score_value_investing") is not None:
+            linhas_av.append(["Score Value Investing", f"{formatar_br(av['score_value_investing'],'numero',0)}/100"])
+        _tabela(linhas_av, [6*cm, 6*cm])
+
+        for titulo, campo in [("Pontos positivos", "pontos_positivos"), ("Pontos de atenção", "pontos_atencao"),
+                               ("Vantagens", "vantagens"), ("Riscos", "riscos")]:
+            itens = av.get(campo)
+            if itens:
+                story.append(Paragraph(titulo, styles['Heading3']))
+                for item in itens:
+                    story.append(Paragraph(f"• {item}", styles['Normal']))
+                story.append(Spacer(1, 6))
+
+    if ibe_resultado:
+        story.append(Paragraph("Índice de Boa Empresa", styles['Heading2']))
+        _tabela([
+            ["Nota final", f"{ibe_resultado['nota_final']}/100 — {ibe_resultado['classificacao']}"],
+            [f"Valuation/Rating ({ibe_resultado['componente_30_fonte']})",
+             str(ibe_resultado['nota_rating'] if ibe_resultado['nota_rating'] is not None else ibe_resultado['nota_valuation'])],
+            ["Qualidade Financeira", str(ibe_resultado['nota_qualidade_financeira'])],
+            ["Qualidade do Negócio", str(ibe_resultado['nota_qualidade_negocio'])],
+        ], [6*cm, 6*cm])
+
+    if historico:
+        story.append(Paragraph("Histórico de Lucros", styles['Heading2']))
+        linhas_h = [["Ano", "Lucro Líquido"]] + [
+            [str(h.get("ano","")), formatar_br(h.get("lucro_liquido"), "moeda")] for h in historico]
+        _tabela(linhas_h, [4*cm, 6*cm], cabecalho=True)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def buscar_rating_links(nome_empresa):
@@ -1591,19 +1722,63 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
 
             elif step == 3:
                 st.write("**Etapa 3 — Avaliação qualitativa.**")
+                st.caption("Hoje esses campos são preenchidos manualmente (com base na sua leitura/pesquisa). "
+                           "No futuro, se decidir ligar a API de IA, esses mesmos campos poderão ser "
+                           "preenchidos automaticamente sem precisar mudar a estrutura.")
                 av = sb_select("avaliacao_qualitativa_buffett","*",filtros={"empresa_id":emp_id})
                 atual = av[0] if av else {}
+
+                def _lista_para_texto(lst):
+                    if not lst:
+                        return ""
+                    if isinstance(lst, str):
+                        return lst
+                    return "\n".join(str(x) for x in lst)
+
                 with st.form("fluxo_buffett"):
+                    st.markdown("##### Moat (vantagem competitiva)")
                     moat = st.selectbox("Moat",["nenhum","fraco","moderado","forte"],index=["nenhum","fraco","moderado","forte"].index(atual.get("moat","nenhum")) if atual.get("moat") else 0)
-                    moat_just = st.text_area("Justificativa do moat", atual.get("moat_justificativa",""))
+                    moat_just = st.text_area("Justificativa do moat", atual.get("moat_justificativa","") or "")
                     gestao = st.slider("Qualidade da gestão (1-5)",1,5,int(atual.get("qualidade_gestao",3) or 3))
                     prev = st.selectbox("Previsibilidade",["baixa","media","alta"],index=["baixa","media","alta"].index(atual.get("previsibilidade","media")) if atual.get("previsibilidade") else 1)
                     circulo = st.checkbox("Dentro do meu círculo de competência?", bool(atual.get("circulo_competencia",False)))
+
+                    st.markdown("---")
+                    st.markdown("##### Score e nota de qualidade")
+                    cq1, cq2 = st.columns(2)
+                    nota_qualidade_10 = cq1.slider("Nota de qualidade (0-10)", 0.0, 10.0,
+                                                    float(atual.get("nota_qualidade_10") or 5.0), step=0.1)
+                    score_vi = cq2.number_input("Score Value Investing (0-100)", 0.0, 100.0,
+                                                 float(atual.get("score_value_investing") or 50.0))
+                    st.caption(f"Prévia das estrelas: {'⭐' * round(nota_qualidade_10/2)}{'☆' * (5-round(nota_qualidade_10/2))}")
+
+                    st.markdown("---")
+                    st.markdown("##### Análise (um item por linha)")
+                    ap1, ap2 = st.columns(2)
+                    pontos_positivos_txt = ap1.text_area("✅ Pontos positivos", _lista_para_texto(atual.get("pontos_positivos")), height=120)
+                    pontos_atencao_txt = ap2.text_area("⚠️ Pontos de atenção", _lista_para_texto(atual.get("pontos_atencao")), height=120)
+                    av1, av2 = st.columns(2)
+                    vantagens_txt = av1.text_area("💪 Vantagens", _lista_para_texto(atual.get("vantagens")), height=120)
+                    riscos_txt = av2.text_area("🚨 Riscos", _lista_para_texto(atual.get("riscos")), height=120)
+
                     if st.form_submit_button("💾 Salvar avaliação"):
-                        gravar_com_confirmacao(sb_upsert, "avaliacao_qualitativa_buffett",
-                            {"empresa_id":emp_id,"moat":moat,"moat_justificativa":moat_just,"qualidade_gestao":gestao,
-                             "previsibilidade":prev,"circulo_competencia":circulo,"data_avaliacao":date.today().isoformat()},
-                            msg_ok="✅ Avaliação salva com sucesso.", msg_erro="❌ Não foi possível salvar a avaliação.")
+                        payload_av = {
+                            "empresa_id": emp_id, "moat": moat, "moat_justificativa": moat_just,
+                            "qualidade_gestao": gestao, "previsibilidade": prev, "circulo_competencia": circulo,
+                            "data_avaliacao": date.today().isoformat(),
+                            "nota_qualidade_10": nota_qualidade_10, "score_value_investing": score_vi,
+                            "pontos_positivos": [l.strip() for l in pontos_positivos_txt.split("\n") if l.strip()],
+                            "pontos_atencao": [l.strip() for l in pontos_atencao_txt.split("\n") if l.strip()],
+                            "vantagens": [l.strip() for l in vantagens_txt.split("\n") if l.strip()],
+                            "riscos": [l.strip() for l in riscos_txt.split("\n") if l.strip()],
+                            "fonte_analise": "Manual",
+                        }
+                        if av:
+                            gravar_com_confirmacao(sb_update, "avaliacao_qualitativa_buffett", payload_av, {"id": av[0]["id"]},
+                                msg_ok="✅ Avaliação atualizada com sucesso.", msg_erro="❌ Não foi possível atualizar a avaliação.")
+                        else:
+                            gravar_com_confirmacao(sb_insert, "avaliacao_qualitativa_buffett", payload_av,
+                                msg_ok="✅ Avaliação salva com sucesso.", msg_erro="❌ Não foi possível salvar a avaliação.")
 
             elif step == 4:
                 st.write("**Etapa 4 — Relatório final: Comprar, Manter ou Vender?**")
@@ -2049,7 +2224,7 @@ elif pagina == "4. Critérios e Índice de Qualidade":
                         av=(av_c[0] if av_c else {}), banco_dados=(banco_c[0] if banco_c else {}),
                         historico_lucros=historico_c,
                     )
-                    res_ibe = sb_upsert("indice_boa_empresa", {
+                    payload_ibe_c = {
                         "empresa_id": eid, "data_calculo": date.today().isoformat(),
                         "nota_valuation": resultado_c["nota_valuation"],
                         "nota_qualidade_financeira": resultado_c["nota_qualidade_financeira"],
@@ -2058,7 +2233,13 @@ elif pagina == "4. Critérios e Índice de Qualidade":
                         "nota_final": resultado_c["nota_final"],
                         "classificacao": resultado_c["classificacao"],
                         "detalhes": resultado_c["detalhes"],
-                    })
+                    }
+                    existente_ibe_c = sb_select("indice_boa_empresa", "id",
+                        filtros={"empresa_id": eid, "data_calculo": date.today().isoformat()})
+                    if existente_ibe_c:
+                        res_ibe = sb_update("indice_boa_empresa", payload_ibe_c, {"id": existente_ibe_c[0]["id"]})
+                    else:
+                        res_ibe = sb_insert("indice_boa_empresa", payload_ibe_c)
                     if not res_ibe:
                         erros.append(f"{row['ticker']}: calculado mas não confirmado salvo no banco")
                 except Exception as e:
@@ -2377,6 +2558,7 @@ elif pagina == "7. Relatório da Ação":
 
         st.markdown("---")
         bals_rel = sb_select("balancos_dre", "*", filtros={"empresa_id": emp_id_rel}, ordem="data_referencia")
+        bal_rel, inds_calc_rel, inds_def_rel, vis_rel = None, [], [], []
         if not bals_rel:
             st.warning("Sem balanço lançado ainda para esta empresa. Use o Fluxo de Análise guiado, Etapa 1.")
         else:
@@ -2433,12 +2615,42 @@ elif pagina == "7. Relatório da Ação":
             av4.metric("Círculo de competência", "Sim" if a_rel.get("circulo_competencia") else "Não")
             if a_rel.get("moat_justificativa"):
                 st.caption(f"Justificativa do moat: {a_rel['moat_justificativa']}")
+
+            nota10 = a_rel.get("nota_qualidade_10")
+            score_vi_rel = a_rel.get("score_value_investing")
+            if nota10 is not None or score_vi_rel is not None:
+                st.markdown("---")
+                cq1, cq2 = st.columns(2)
+                if nota10 is not None:
+                    n_estrelas = round(float(nota10)/2)
+                    cq1.metric("Nota de qualidade", f"{formatar_br(nota10,'numero',1)}/10")
+                    cq1.markdown("⭐"*n_estrelas + "☆"*(5-n_estrelas))
+                if score_vi_rel is not None:
+                    cq2.metric("Score Value Investing", f"{formatar_br(score_vi_rel,'numero',0)}/100")
+                st.caption(f"Fonte da análise: {a_rel.get('fonte_analise') or 'Manual'}")
+
+            def _exibir_lista(titulo, campo, icone):
+                itens = a_rel.get(campo)
+                if itens:
+                    st.markdown(f"**{icone} {titulo}**")
+                    for item in itens:
+                        st.markdown(f"- {item}")
+
+            if any(a_rel.get(c) for c in ["pontos_positivos","pontos_atencao","vantagens","riscos"]):
+                st.markdown("---")
+                cl1, cl2 = st.columns(2)
+                with cl1:
+                    _exibir_lista("Pontos positivos", "pontos_positivos", "✅")
+                    _exibir_lista("Vantagens", "vantagens", "💪")
+                with cl2:
+                    _exibir_lista("Pontos de atenção", "pontos_atencao", "⚠️")
+                    _exibir_lista("Riscos", "riscos", "🚨")
         else:
             st.caption("Avaliação qualitativa ainda não feita — use a Etapa 3 do Fluxo Guiado.")
 
         st.markdown("---")
         st.subheader("⭐ Índice de Boa Empresa")
-        renderizar_diagnostico_boa_empresa(emp_id_rel, emp_rel)
+        ibe_resultado_rel = renderizar_diagnostico_boa_empresa(emp_id_rel, emp_rel)
 
         st.markdown("---")
         st.subheader("📈 Histórico de Lucros")
@@ -2449,8 +2661,27 @@ elif pagina == "7. Relatório da Ação":
             st.caption("Sem histórico de lucro cadastrado (pode adicionar na tela '1. Empresas e Setores').")
 
         st.markdown("---")
-        if st.button("🧭 Ir para o Fluxo de Análise guiado desta ação", type="primary"):
+        col_rel1, col_rel2 = st.columns(2)
+        if col_rel1.button("🧭 Ir para o Fluxo de Análise guiado desta ação", type="primary"):
             iniciar_fluxo_analise(emp_id_rel)
+
+        if col_rel2.button("📄 Gerar PDF deste relatório"):
+            with st.spinner("Gerando PDF..."):
+                try:
+                    pdf_bytes = gerar_pdf_relatorio_acao(
+                        emp=emp_rel, bal=bal_rel, inds_calc=inds_calc_rel, inds_def=inds_def_rel,
+                        vis=vis_rel, av=(av_rel[0] if av_rel else None),
+                        ibe_resultado=ibe_resultado_rel, historico=hist_rel,
+                    )
+                    st.session_state["pdf_relatorio_bytes"] = pdf_bytes
+                    st.session_state["pdf_relatorio_nome"] = f"relatorio_{emp_rel['ticker']}.pdf"
+                except Exception as e:
+                    st.error(f"❌ Não foi possível gerar o PDF: {e}")
+
+        if "pdf_relatorio_bytes" in st.session_state:
+            st.download_button("⬇️ Baixar PDF", data=st.session_state["pdf_relatorio_bytes"],
+                                file_name=st.session_state.get("pdf_relatorio_nome","relatorio.pdf"),
+                                mime="application/pdf")
 
 elif pagina == "8. Informações Relevantes":
     st.header("📰 Informações Relevantes do Mercado")
