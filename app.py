@@ -1,10 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v2.3
-GERADO EM: 2026-07-03 03:58 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Removidas as 3 telas redundantes com o Fluxo Guiado;
-implementado "7. Relatório da Ação" com filtro de empresa.
+VERSÃO DESTE ARQUIVO: v2.5
+GERADO EM: 2026-07-03 04:05 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Fluxo Guiado agora sempre começa em branco quando acessado
+pelo menu lateral (antes continuava com a última empresa analisada, sem
+avisar).
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -126,6 +127,23 @@ HISTÓRICO:
   tudo que já foi levantado sobre ela (balanço, indicadores, valor
   intrínseco, avaliação Buffett, Índice de Boa Empresa, histórico de
   lucro), com atalho pra abrir o Fluxo Guiado se quiser atualizar algo.
+- v2.4 (2026-07-03): Identificado que "buscou com sucesso mas os campos
+  continuam 0" não era bug — o formulário "Ou lance manualmente" sempre foi
+  um formulário separado com valores fixos em 0,00, que nunca refletia o
+  que a busca automática trouxe. Corrigido: a Etapa 1 do Fluxo Guiado agora
+  mostra um resumo com os valores reais do balanço mais recente logo após
+  a mensagem de sucesso, e o formulário manual vem pré-preenchido com esses
+  valores (em vez de zeros), para editar em cima em vez de digitar tudo de
+  novo. Também alerta se o balanço salvo estiver com os campos principais
+  vazios (sinal de uma busca anterior incompleta).
+- v2.5 (2026-07-03): Corrigido o Fluxo Guiado sempre "resumir" a última
+  empresa analisada, mesmo entrando por ele de novo pelo menu lateral —
+  isso é o comportamento normal do Streamlit (mantém o estado da sessão),
+  mas não era o esperado pelo usuário. Agora um flag (_fluxo_ativo_
+  confirmado) distingue "entrei pelo menu" (sempre pede pra escolher a
+  ação) de "vim de um botão Iniciar Fluxo de Análise" de outra tela (aí sim
+  continua direto na empresa escolhida). O "🔁 Trocar de ação" e a
+  navegação entre Etapas continuam funcionando como antes.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -172,6 +190,14 @@ pagina = st.sidebar.radio("Navegação", [
     "10. Tabelas de Apoio",
     "11. Administração de Usuários",
 ], key="nav_radio")
+
+# Se o usuário está em QUALQUER outra tela, "desarma" o Fluxo Guiado — assim,
+# ao entrar nele pelo menu lateral, sempre começa em branco (pedindo pra
+# escolher a ação). Só continua de onde parou quando vem de um botão
+# "Iniciar Fluxo de Análise" (que usa iniciar_fluxo_analise() e marca esse
+# mesmo flag como True antes de navegar pra cá).
+if pagina != "🧭 Fluxo de Análise (guiado)":
+    st.session_state["_fluxo_ativo_confirmado"] = False
 
 # ---------- HELPERS ----------
 
@@ -1014,6 +1040,7 @@ def selecionar_empresa(label="Ação", key=None):
 def iniciar_fluxo_analise(empresa_id):
     st.session_state["fluxo_empresa_id"] = int(empresa_id)
     st.session_state["fluxo_step"] = 1
+    st.session_state["_fluxo_ativo_confirmado"] = True
     st.session_state["nav_radio"] = "🧭 Fluxo de Análise (guiado)"
     st.rerun()
 
@@ -1292,6 +1319,13 @@ elif pagina == "0b. Minha Lista de Análise":
 
 # ================================================================
 elif pagina == "🧭 Fluxo de Análise (guiado)":
+    if not st.session_state.get("_fluxo_ativo_confirmado", False):
+        # chegou aqui pelo menu lateral (não por um botão "Iniciar Fluxo de
+        # Análise" de outra tela) — limpa a empresa anterior pra sempre
+        # pedir escolha, em vez de continuar de onde parou sem avisar.
+        st.session_state.pop("fluxo_empresa_id", None)
+    st.session_state["_fluxo_ativo_confirmado"] = True
+
     st.header("🧭 Fluxo de Análise Guiado")
     if "fluxo_empresa_id" not in st.session_state:
         st.info("Escolha a ação para começar.")
@@ -1319,9 +1353,26 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
 
             if step == 1:
                 st.write("**Etapa 1 — Balanço / DRE**")
-                bals = sb_select("balancos_dre","data_referencia", filtros={"empresa_id": emp_id}, ordem="data_referencia")
+                bals = sb_select("balancos_dre","*", filtros={"empresa_id": emp_id}, ordem="data_referencia")
+                ultimo_bal = bals[-1] if bals else {}
                 if bals:
-                    st.success(f"✅ Balanço já existe: {', '.join([b['data_referencia'] for b in bals])}. Pode avançar ou buscar dados mais recentes.")
+                    st.success(f"✅ Balanço já existe: {', '.join([b['data_referencia'] for b in bals])}. "
+                               "Pode avançar ou buscar dados mais recentes.")
+                    st.markdown(f"**Dados atuais do balanço mais recente ({ultimo_bal['data_referencia']}, "
+                                f"fonte: {ultimo_bal.get('fonte','—')}):**")
+                    m1,m2,m3,m4 = st.columns(4)
+                    m1.metric("Ativo Total", f"{ultimo_bal.get('total_assets') or 0:,.0f}")
+                    m2.metric("Patrim. Líquido", f"{ultimo_bal.get('total_equity') or 0:,.0f}")
+                    m3.metric("Dívida Líquida", f"{ultimo_bal.get('net_debt') or 0:,.0f}")
+                    m4.metric("Preço mercado", f"R$ {ultimo_bal.get('preco_mercado_referencia') or 0:,.2f}")
+                    m5,m6,m7 = st.columns(3)
+                    m5.metric("Receita", f"{ultimo_bal.get('total_revenue') or 0:,.0f}")
+                    m6.metric("EBIT", f"{ultimo_bal.get('ebit') or 0:,.0f}")
+                    m7.metric("Lucro Líquido", f"{ultimo_bal.get('net_income') or 0:,.0f}")
+                    if not any([ultimo_bal.get('total_assets'), ultimo_bal.get('net_income')]):
+                        st.warning("⚠️ Esse balanço existe no banco mas está com os valores principais vazios "
+                                   "(provavelmente uma busca anterior não trouxe dados completos). Clique em "
+                                   "'Buscar balanço automático agora' de novo, ou preencha manualmente abaixo.")
 
                 st.subheader("🌐 Buscar balanço automaticamente (Fundamentus, com Yahoo Finance de reserva)")
                 st.caption("Clique para buscar os dados mais recentes do balanço e DRE — tenta o Fundamentus "
@@ -1347,24 +1398,26 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                             st.info("Verifique se o ticker está correto (ex.: TRIS3, B3SA3) e tente novamente.")
 
                 st.markdown("---")
-                st.subheader("✏️ Ou lance manualmente")
+                st.subheader("✏️ Ou lance/edite manualmente")
+                st.caption("Este formulário já vem preenchido com o último balanço salvo (se existir), "
+                           "pra você ajustar em vez de digitar tudo de novo.")
                 with st.form("fluxo_balanco"):
-                    data_ref = st.text_input("Data de referência", "2024-12-31")
+                    data_ref = st.text_input("Data de referência", ultimo_bal.get("data_referencia", "2024-12-31"))
                     c1,c2,c3 = st.columns(3)
                     dados_bal = {
                         "empresa_id": emp_id, "data_referencia": data_ref,
-                        "total_assets": c1.number_input("Total Assets",value=0.0),
-                        "total_liabilities": c2.number_input("Total Liabilities",value=0.0),
-                        "total_equity": c3.number_input("Total Equity",value=0.0),
-                        "net_debt": c1.number_input("Dívida Líquida",value=0.0),
-                        "share_issued": c2.number_input("Nº Ações (milhares)",value=0.0),
-                        "preco_mercado_referencia": c3.number_input("Preço de mercado",value=0.0),
-                        "total_revenue": c1.number_input("Total Revenue",value=0.0),
-                        "net_income": c2.number_input("Net Income",value=0.0),
-                        "ebitda": c3.number_input("EBITDA",value=0.0),
-                        "ebit": c1.number_input("EBIT",value=0.0),
-                        "depreciacao_amortizacao": c2.number_input("Depreciação",value=0.0),
-                        "capex": c3.number_input("CAPEX",value=0.0),
+                        "total_assets": c1.number_input("Total Assets",value=float(ultimo_bal.get("total_assets") or 0.0)),
+                        "total_liabilities": c2.number_input("Total Liabilities",value=float(ultimo_bal.get("total_liabilities") or 0.0)),
+                        "total_equity": c3.number_input("Total Equity",value=float(ultimo_bal.get("total_equity") or 0.0)),
+                        "net_debt": c1.number_input("Dívida Líquida",value=float(ultimo_bal.get("net_debt") or 0.0)),
+                        "share_issued": c2.number_input("Nº Ações (milhares)",value=float(ultimo_bal.get("share_issued") or 0.0)),
+                        "preco_mercado_referencia": c3.number_input("Preço de mercado",value=float(ultimo_bal.get("preco_mercado_referencia") or 0.0)),
+                        "total_revenue": c1.number_input("Total Revenue",value=float(ultimo_bal.get("total_revenue") or 0.0)),
+                        "net_income": c2.number_input("Net Income",value=float(ultimo_bal.get("net_income") or 0.0)),
+                        "ebitda": c3.number_input("EBITDA",value=float(ultimo_bal.get("ebitda") or 0.0)),
+                        "ebit": c1.number_input("EBIT",value=float(ultimo_bal.get("ebit") or 0.0)),
+                        "depreciacao_amortizacao": c2.number_input("Depreciação",value=float(ultimo_bal.get("depreciacao_amortizacao") or 0.0)),
+                        "capex": c3.number_input("CAPEX",value=float(ultimo_bal.get("capex") or 0.0)),
                         "fonte": "Lançado manualmente"
                     }
                     if st.form_submit_button("💾 Salvar balanço manual"):
