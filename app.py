@@ -1,11 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v2.2
-GERADO EM: 2026-07-02 22:17 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Implementada a tela "8. Informações Relevantes" como painel
-de mercado (Ibovespa/Dólar/S&P500 + notícias agregadas), separado das
-notícias de empresa específica.
+VERSÃO DESTE ARQUIVO: v2.3
+GERADO EM: 2026-07-03 03:58 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Removidas as 3 telas redundantes com o Fluxo Guiado;
+implementado "7. Relatório da Ação" com filtro de empresa.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -118,6 +117,15 @@ HISTÓRICO:
   buscar_cotacao_tempo_real, que ganhou mapeamento pra câmbio) + lista de
   notícias agregadas e ordenadas por data mais recente, com filtro por
   fonte. Cada fonte que falhar é pulada sem travar as demais.
+- v2.3 (2026-07-03): Por decisão do usuário, removidas do menu as 3 telas
+  que duplicavam o Fluxo de Análise Guiado sem ter conteúdo próprio
+  ("2. Balanço/DRE", "3. Indicadores e Valor Intrínseco",
+  "5. Avaliação Buffett") — essa funcionalidade já vive nas Etapas 1-3 do
+  Fluxo Guiado. Implementada de verdade a tela "7. Relatório da Ação":
+  filtro pra escolher a empresa e relatório somente-leitura consolidando
+  tudo que já foi levantado sobre ela (balanço, indicadores, valor
+  intrínseco, avaliação Buffett, Índice de Boa Empresa, histórico de
+  lucro), com atalho pra abrir o Fluxo Guiado se quiser atualizar algo.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -156,10 +164,7 @@ pagina = st.sidebar.radio("Navegação", [
     "0b. Minha Lista de Análise",
     "🧭 Fluxo de Análise (guiado)",
     "1. Empresas e Setores",
-    "2. Balanço / DRE",
-    "3. Indicadores e Valor Intrínseco",
     "4. Critérios e Índice de Qualidade",
-    "5. Avaliação Buffett (qualitativo)",
     "6. Carteira",
     "7. Relatório da Ação",
     "8. Informações Relevantes",
@@ -2219,6 +2224,106 @@ elif pagina == "11. Administração de Usuários":
                         st.rerun()
 
 # ================================================================
+elif pagina == "7. Relatório da Ação":
+    st.header("📄 Relatório da Ação")
+    st.caption("Consulta o que já foi levantado sobre uma empresa (balanço, indicadores, valor "
+               "intrínseco, avaliação qualitativa e Índice de Boa Empresa). Para atualizar os dados, "
+               "use o '🧭 Fluxo de Análise (guiado)'.")
+
+    empresa_rel = selecionar_empresa("Escolha a ação para ver o relatório", key="relatorio_empresa_sel")
+    if empresa_rel is None:
+        st.info("Cadastre uma empresa em '1. Empresas e Setores' para poder ver um relatório.")
+    else:
+        emp_id_rel = int(empresa_rel["id"])
+        emp_rel = sb_select("empresas", "*", filtros={"id": emp_id_rel})[0]
+
+        st.subheader(f"{emp_rel['ticker']} — {emp_rel['razao_social']}")
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("Setor", emp_rel.get("setor_id") and next(
+            (s["nome"] for s in sb_select("setores","id,nome") if s["id"]==emp_rel["setor_id"]), "—") or "—")
+        i2.metric("Rating", emp_rel.get("rating") or "—")
+        i3.metric("Situação", emp_rel.get("situacao_codigo") or "—")
+        i4.metric("Segmento", emp_rel.get("segmento") or "—")
+        if emp_rel.get("descricao_negocio"):
+            with st.expander("Descrição do negócio"):
+                st.write(emp_rel["descricao_negocio"])
+
+        st.markdown("---")
+        bals_rel = sb_select("balancos_dre", "*", filtros={"empresa_id": emp_id_rel}, ordem="data_referencia")
+        if not bals_rel:
+            st.warning("Sem balanço lançado ainda para esta empresa. Use o Fluxo de Análise guiado, Etapa 1.")
+        else:
+            bal_rel = bals_rel[-1]
+            st.subheader(f"📊 Balanço / DRE (referência: {bal_rel['data_referencia']}, fonte: {bal_rel.get('fonte','—')})")
+            r1,r2,r3,r4 = st.columns(4)
+            r1.metric("Ativo Total", f"R$ {bal_rel.get('total_assets',0):,.0f}" if bal_rel.get("total_assets") else "—")
+            r2.metric("Patrimônio Líq.", f"R$ {bal_rel.get('total_equity',0):,.0f}" if bal_rel.get("total_equity") else "—")
+            r3.metric("Dívida Líquida", f"R$ {bal_rel.get('net_debt',0):,.0f}" if bal_rel.get("net_debt") is not None else "—")
+            r4.metric("Preço de mercado", f"R$ {bal_rel.get('preco_mercado_referencia',0):,.2f}" if bal_rel.get("preco_mercado_referencia") else "—")
+            r5,r6,r7 = st.columns(3)
+            r5.metric("Receita (12m)", f"R$ {bal_rel.get('total_revenue',0):,.0f}" if bal_rel.get("total_revenue") else "—")
+            r6.metric("EBIT (12m)", f"R$ {bal_rel.get('ebit',0):,.0f}" if bal_rel.get("ebit") else "—")
+            r7.metric("Lucro Líquido (12m)", f"R$ {bal_rel.get('net_income',0):,.0f}" if bal_rel.get("net_income") else "—")
+
+            st.markdown("---")
+            st.subheader("📈 Indicadores fundamentalistas")
+            inds_calc_rel = sb_select("indicadores_calculados","*",filtros={"empresa_id":emp_id_rel})
+            if inds_calc_rel:
+                inds_def_rel = sb_select("indicadores_definicao","id,nome")
+                df_ic_rel = pd.DataFrame(inds_calc_rel)
+                df_ic_rel["indicador"] = df_ic_rel["indicador_id"].apply(
+                    lambda iid: next((i["nome"] for i in inds_def_rel if i["id"]==iid), f"#{iid}"))
+                cols_show_rel = [c for c in ["indicador","valor","data_referencia","fonte"] if c in df_ic_rel.columns]
+                st.dataframe(df_ic_rel[cols_show_rel], use_container_width=True, hide_index=True)
+            else:
+                st.caption("Nenhum indicador calculado ainda — use a Etapa 2 do Fluxo Guiado.")
+
+            st.markdown("---")
+            st.subheader("💰 Valor Intrínseco")
+            vis_rel = sb_select("valor_intrinseco","metodo,valor",filtros={"empresa_id":emp_id_rel,"data_referencia":bal_rel["data_referencia"]})
+            if vis_rel:
+                st.dataframe(pd.DataFrame(vis_rel), use_container_width=True, hide_index=True)
+                vi_medio_rel = sum(v["valor"] for v in vis_rel)/len(vis_rel)
+                preco_rel = bal_rel.get("preco_mercado_referencia")
+                if preco_rel:
+                    margem_rel = calc.margem_seguranca(vi_medio_rel, preco_rel)
+                    classe_rel = calc.classificar(margem_rel)
+                    cor_rel = "green" if classe_rel=="Comprar" else ("orange" if classe_rel=="Observar" else "red")
+                    st.markdown(f"**VI médio: R$ {vi_medio_rel:.2f} | Margem: {margem_rel:.1f}% | :{cor_rel}[{classe_rel}]**")
+            else:
+                st.caption("Valor intrínseco ainda não calculado — use a Etapa 2 do Fluxo Guiado.")
+
+        st.markdown("---")
+        st.subheader("🧠 Avaliação Qualitativa (Buffett)")
+        av_rel = sb_select("avaliacao_qualitativa_buffett","*",filtros={"empresa_id":emp_id_rel})
+        if av_rel:
+            a_rel = av_rel[0]
+            av1,av2,av3,av4 = st.columns(4)
+            av1.metric("Moat", a_rel.get("moat") or "—")
+            av2.metric("Qualidade gestão", a_rel.get("qualidade_gestao") or "—")
+            av3.metric("Previsibilidade", a_rel.get("previsibilidade") or "—")
+            av4.metric("Círculo de competência", "Sim" if a_rel.get("circulo_competencia") else "Não")
+            if a_rel.get("moat_justificativa"):
+                st.caption(f"Justificativa do moat: {a_rel['moat_justificativa']}")
+        else:
+            st.caption("Avaliação qualitativa ainda não feita — use a Etapa 3 do Fluxo Guiado.")
+
+        st.markdown("---")
+        st.subheader("⭐ Índice de Boa Empresa")
+        renderizar_diagnostico_boa_empresa(emp_id_rel, emp_rel)
+
+        st.markdown("---")
+        st.subheader("📈 Histórico de Lucros")
+        hist_rel = sb_select("historico_resultados","*",filtros={"empresa_id":emp_id_rel},ordem="ano")
+        if hist_rel:
+            st.dataframe(pd.DataFrame(hist_rel)[["ano","lucro_liquido","teve_prejuizo"]], use_container_width=True, hide_index=True)
+        else:
+            st.caption("Sem histórico de lucro cadastrado (pode adicionar na tela '1. Empresas e Setores').")
+
+        st.markdown("---")
+        if st.button("🧭 Ir para o Fluxo de Análise guiado desta ação", type="primary"):
+            iniciar_fluxo_analise(emp_id_rel)
+
 elif pagina == "8. Informações Relevantes":
     st.header("📰 Informações Relevantes do Mercado")
     st.caption("Painel diário do que pode afetar a bolsa, o Brasil e o mundo — Ibovespa, câmbio, índices "
