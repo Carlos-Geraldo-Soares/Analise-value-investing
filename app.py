@@ -1,11 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v2.5
-GERADO EM: 2026-07-03 04:05 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Fluxo Guiado agora sempre começa em branco quando acessado
-pelo menu lateral (antes continuava com a última empresa analisada, sem
-avisar).
+VERSÃO DESTE ARQUIVO: v2.6
+GERADO EM: 2026-07-03 04:15 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Corrigido erro "duplicate key" ao buscar balanço de uma
+data que já existia — mesmo bug do Rating, agora em balancos_dre.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -144,6 +143,18 @@ HISTÓRICO:
   ação) de "vim de um botão Iniciar Fluxo de Análise" de outra tela (aí sim
   continua direto na empresa escolhida). O "🔁 Trocar de ação" e a
   navegação entre Etapas continuam funcionando como antes.
+- v2.6 (2026-07-03): Corrigido erro real revelado pela v1.3/v1.5 (mensagens
+  de erro visíveis): "duplicate key value violates unique constraint
+  balancos_dre_empresa_id_data_referencia_key" ao clicar em "Buscar balanço
+  automático" pra uma data que já tinha balanço salvo — mesma causa raiz do
+  bug do Rating (sb_upsert tentando INSERT em vez de UPDATE). Criada
+  salvar_balanco(), que primeiro verifica se já existe um balanço pra essa
+  (empresa_id, data_referencia) e faz UPDATE nesse caso, ou INSERT se for
+  novo — testado isoladamente e confirmado que escolhe a ação certa nos
+  dois casos. Aplicada nos 3 lugares que salvam balanço (busca automática
+  na Etapa 1, formulário manual, botão Atualizar na tela de Empresas).
+  Também corrigido "fonte: None" aparecendo literalmente na tela quando o
+  balanço não tinha fonte registrada — agora mostra "—".
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -608,6 +619,32 @@ def buscar_balanco_multi_fonte(ticker):
         return calc.buscar_balanco_yfinance(ticker) or {}
     except Exception:
         return {}
+
+
+def salvar_balanco(dados_bal, msg_ok=None, msg_erro=None):
+    """
+    Salva um balanço em balancos_dre fazendo UPDATE se já existir uma linha
+    pra essa (empresa_id, data_referencia), ou INSERT se não existir.
+    Existe porque sb_upsert() tentava sempre INSERIR, e como
+    (empresa_id, data_referencia) é único na tabela, batia em
+    "duplicate key value violates unique constraint" toda vez que o
+    balanço daquela data já existia — mesmo problema que já corrigimos no
+    cadastro de empresa (rating), agora aplicado aqui.
+    Retorna o resultado da gravação (truthy) ou None se falhou.
+    """
+    empresa_id = dados_bal.get("empresa_id")
+    data_referencia = dados_bal.get("data_referencia")
+    payload = {k: v for k, v in dados_bal.items() if v is not None}
+
+    existente = sb_select("balancos_dre", "id", filtros={"empresa_id": empresa_id, "data_referencia": data_referencia})
+    if existente:
+        return gravar_com_confirmacao(sb_update, "balancos_dre", payload, {"id": existente[0]["id"]},
+            msg_ok=msg_ok or "✅ Balanço atualizado com sucesso.",
+            msg_erro=msg_erro or "❌ Não foi possível atualizar o balanço.")
+    else:
+        return gravar_com_confirmacao(sb_insert, "balancos_dre", payload,
+            msg_ok=msg_ok or "✅ Balanço salvo com sucesso.",
+            msg_erro=msg_erro or "❌ Não foi possível salvar o balanço.")
 
 
 # índices que não seguem o padrão "TICKER.SA" — mapeados pro código do Yahoo Finance
@@ -1359,7 +1396,7 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                     st.success(f"✅ Balanço já existe: {', '.join([b['data_referencia'] for b in bals])}. "
                                "Pode avançar ou buscar dados mais recentes.")
                     st.markdown(f"**Dados atuais do balanço mais recente ({ultimo_bal['data_referencia']}, "
-                                f"fonte: {ultimo_bal.get('fonte','—')}):**")
+                                f"fonte: {ultimo_bal.get('fonte') or '—'}):**")
                     m1,m2,m3,m4 = st.columns(4)
                     m1.metric("Ativo Total", f"{ultimo_bal.get('total_assets') or 0:,.0f}")
                     m2.metric("Patrim. Líquido", f"{ultimo_bal.get('total_equity') or 0:,.0f}")
@@ -1383,8 +1420,7 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                             dados = buscar_balanco_multi_fonte(emp["ticker"])
                             if dados.get("data_referencia"):
                                 dados["empresa_id"] = emp_id
-                                r = gravar_com_confirmacao(sb_upsert, "balancos_dre",
-                                    {k:v for k,v in dados.items() if v is not None},
+                                r = salvar_balanco(dados,
                                     msg_ok=f"✅ Balanço de {dados['data_referencia']} importado da fonte "
                                            f"{dados.get('fonte','desconhecida')} e salvo com sucesso.",
                                     msg_erro="❌ Não foi possível salvar o balanço buscado.")
@@ -1421,7 +1457,7 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                         "fonte": "Lançado manualmente"
                     }
                     if st.form_submit_button("💾 Salvar balanço manual"):
-                        r = gravar_com_confirmacao(sb_upsert, "balancos_dre", dados_bal,
+                        r = salvar_balanco(dados_bal,
                             msg_ok="✅ Balanço salvo com sucesso.", msg_erro="❌ Não foi possível salvar o balanço.")
                         if r:
                             st.rerun()
@@ -1842,8 +1878,7 @@ elif pagina == "1. Empresas e Setores":
                     if dados_bal.get("data_referencia"):
                         fonte_dados = dados_bal.get("fonte", "desconhecida")
                         dados_bal["empresa_id"] = empresa_id_edicao
-                        r_bal = gravar_com_confirmacao(sb_upsert, "balancos_dre",
-                            {k:v for k,v in dados_bal.items() if v is not None},
+                        r_bal = salvar_balanco(dados_bal,
                             msg_ok=f"✅ Balanço de {dados_bal['data_referencia']} salvo (fonte: {fonte_dados}).",
                             msg_erro="❌ Não foi possível salvar o balanço buscado.")
                         if r_bal:
