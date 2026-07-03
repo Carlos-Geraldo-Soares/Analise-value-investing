@@ -1,11 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v2.1
-GERADO EM: 2026-07-02 22:08 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Screening reorganizado — filtro básico compacto + filtro
-avançado com todos os indicadores (E, não OU) + CNPJ/Razão Social/Setor/
-Segmento cruzados com o próprio banco.
+VERSÃO DESTE ARQUIVO: v2.2
+GERADO EM: 2026-07-02 22:17 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Implementada a tela "8. Informações Relevantes" como painel
+de mercado (Ibovespa/Dólar/S&P500 + notícias agregadas), separado das
+notícias de empresa específica.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -109,6 +109,15 @@ HISTÓRICO:
   (testado: ticker já cadastrado traz razão social/CNPJ/segmento reais,
   ticker não cadastrado fica em branco — não é bug, é limite da fonte).
   Tabela de resultado agora mostra mais linhas de uma vez (altura 500px).
+- v2.2 (2026-07-02): Esclarecido que "8. Informações Relevantes" NÃO é
+  sobre uma empresa (isso já existe dentro da tela de Empresas) — é um
+  painel macro de mercado (Brasil/mundo/índices) tipo jornal diário.
+  Confirmei fontes RSS públicas e gratuitas reais (InfoMoney Mercados/
+  Economia/Mundo, G1 Economia) e testei o parsing e a ordenação por data.
+  Implementada a tela com cotações do dia (Ibovespa, Dólar, S&P500 — usando
+  buscar_cotacao_tempo_real, que ganhou mapeamento pra câmbio) + lista de
+  notícias agregadas e ordenadas por data mais recente, com filtro por
+  fonte. Cada fonte que falhar é pulada sem travar as demais.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -414,6 +423,55 @@ def buscar_cnpj_brapi(ticker):
         return None
 
 
+# ---------- INFORMAÇÕES RELEVANTES DO MERCADO (painel macro, tipo "jornal") ----------
+# Isso é diferente das "Notícias Relevantes" de uma empresa específica (que
+# ficam dentro da tela de Empresas) — aqui é o cenário geral: Brasil, mundo,
+# índices, câmbio, o que pode afetar a bolsa como um todo.
+
+_FONTES_NOTICIAS_MERCADO = [
+    ("InfoMoney - Mercados", "https://www.infomoney.com.br/mercados/feed/"),
+    ("InfoMoney - Economia", "https://www.infomoney.com.br/economia/feed/"),
+    ("InfoMoney - Mundo", "https://www.infomoney.com.br/mundo/feed/"),
+    ("G1 - Economia", "https://g1.globo.com/dynamo/economia/rss2.xml"),
+]
+
+
+def _parse_data_rss(data_str):
+    from datetime import datetime as _dt
+    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z"):
+        try:
+            return _dt.strptime(data_str.strip(), fmt)
+        except Exception:
+            continue
+    return None
+
+
+def buscar_noticias_mercado(max_por_fonte=8):
+    """
+    Busca notícias de Mercado/Economia/Mundo em feeds RSS públicos e
+    gratuitos (InfoMoney, G1) — um "jornal" diário do que pode afetar a
+    bolsa, o Brasil e o mundo, sem ser sobre uma empresa específica.
+    Cada fonte que falhar é simplesmente pulada — nunca trava as demais.
+    """
+    import xml.etree.ElementTree as ET
+    todas = []
+    for fonte_nome, url in _FONTES_NOTICIAS_MERCADO:
+        try:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            root = ET.fromstring(resp.content)
+            for item in root.findall(".//item")[:max_por_fonte]:
+                titulo = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                data_str = item.findtext("pubDate") or ""
+                if titulo:
+                    todas.append({"fonte": fonte_nome, "titulo": titulo, "link": link,
+                                  "data_dt": _parse_data_rss(data_str), "data_str": data_str})
+        except Exception:
+            continue
+    todas.sort(key=lambda x: x["data_dt"].timestamp() if x["data_dt"] else 0, reverse=True)
+    return todas
+
+
 def _buscar_fundamentus_detalhes(ticker):
     """
     Busca a página de detalhes de UM papel no Fundamentus
@@ -526,6 +584,8 @@ _MAPA_INDICES_YF = {
     "IBOV": "^BVSP", "IBOVESPA": "^BVSP", "INDEXBVMF:IBOV": "^BVSP",
     "SP500": "^GSPC", "S&P500": "^GSPC", "DOW": "^DJI", "NASDAQ": "^IXIC",
     "IFIX": "^IFIX.SA",
+    "DOLAR": "BRL=X", "DÓLAR": "BRL=X", "USD": "BRL=X", "USDBRL": "BRL=X",
+    "USDBRL=X": "BRL=X", "EUR": "EURBRL=X",
 }
 
 
@@ -2159,6 +2219,48 @@ elif pagina == "11. Administração de Usuários":
                         st.rerun()
 
 # ================================================================
+elif pagina == "8. Informações Relevantes":
+    st.header("📰 Informações Relevantes do Mercado")
+    st.caption("Painel diário do que pode afetar a bolsa, o Brasil e o mundo — Ibovespa, câmbio, índices "
+               "internacionais e as principais notícias de mercado/economia. Isso é diferente das "
+               "'Notícias Relevantes' de uma empresa específica (que ficam dentro da tela de Empresas).")
+
+    st.subheader("📊 Cotações do dia")
+    with st.spinner("Buscando cotações..."):
+        ibov_preco, ibov_hora = buscar_cotacao_tempo_real("IBOV")
+        dolar_preco, dolar_hora = buscar_cotacao_tempo_real("USDBRL=X")
+        sp500_preco, sp500_hora = buscar_cotacao_tempo_real("SP500")
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Ibovespa", f"{ibov_preco:,.0f} pts" if ibov_preco else "—")
+    q2.metric("Dólar (USD/BRL)", f"R$ {dolar_preco:,.2f}" if dolar_preco else "—")
+    q3.metric("S&P 500", f"{sp500_preco:,.0f} pts" if sp500_preco else "—")
+    st.caption(f"Atualizado em {pd.Timestamp.now().strftime('%d/%m/%Y %H:%M')} "
+               "(~15 min de atraso, padrão do Yahoo Finance).")
+
+    st.markdown("---")
+    st.subheader("🗞️ Últimas notícias de mercado, economia e mundo")
+    if st.button("🔄 Atualizar notícias"):
+        st.session_state.pop("noticias_mercado_cache", None)
+
+    if "noticias_mercado_cache" not in st.session_state:
+        with st.spinner("Buscando notícias..."):
+            st.session_state["noticias_mercado_cache"] = buscar_noticias_mercado()
+
+    noticias = st.session_state["noticias_mercado_cache"]
+    if not noticias:
+        st.warning("Não consegui buscar notícias agora (fontes fora do ar ou mudaram de formato). "
+                   "Tente 'Atualizar notícias' novamente em alguns minutos.")
+    else:
+        fontes_disp = ["Todas"] + sorted(set(n["fonte"] for n in noticias))
+        fonte_sel = st.selectbox("Filtrar por fonte", fontes_disp)
+        for n in noticias:
+            if fonte_sel != "Todas" and n["fonte"] != fonte_sel:
+                continue
+            data_fmt = n["data_dt"].strftime("%d/%m %H:%M") if n["data_dt"] else n["data_str"]
+            st.markdown(f"**[{n['titulo']}]({n['link']})**")
+            st.caption(f"{n['fonte']} — {data_fmt}")
+        st.caption("Fontes: InfoMoney (Mercados, Economia, Mundo) e G1 Economia — feeds públicos e gratuitos.")
+
 elif pagina == "9. Índices Macroeconômicos":
     st.header("Índices Macroeconômicos")
     st.caption("IPCA, CDI, IGP-M, Selic e Ibovespa — série histórica completa e valores mensais. "
