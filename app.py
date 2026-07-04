@@ -1,11 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v3.0
-GERADO EM: 2026-07-03 12:59 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Etapa 3 ganhou campos analíticos (Score Value Investing,
-pontos positivos/atenção, vantagens, riscos, nota de qualidade); Relatório
-da Ação agora exporta em PDF. REQUER reportlab no requirements.txt.
+VERSÃO DESTE ARQUIVO: v3.3
+GERADO EM: 2026-07-03 18:20 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Corrigido o botão de template de importação de índices, que
+a tela prometia mas nunca existia de verdade.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -189,6 +188,41 @@ HISTÓRICO:
   existe, UPDATE ou INSERT" já usado em balancos_dre e no Rating.
   IMPORTANTE: adicionar "reportlab" ao requirements.txt, ou o botão de PDF
   vai dar erro "No module named reportlab".
+- v3.1 (2026-07-03): Analisada a planilha antiga do usuário (ADM Carteiras
+  de Ações) — confirmado que o resumo "carteira x ações resultante do
+  histórico" JÁ EXISTIA (aba "📊 Resultado" da tela de Carteira, que já usa
+  movimentos_carteira via calc.apurar_carteira). Decisão consciente de
+  manter isso como CÁLCULO NA HORA em vez de uma tabela persistida
+  separada — evita o mesmo tipo de bug de dessincronia já corrigido em
+  outras telas. Adicionadas as 3 colunas que faltavam comparado à planilha:
+  "Nº Operações" (contagem de movimentos), "Distrib. Atual %" (peso de
+  cada ação no total da carteira) e "Custo do Capital (RF)" — nova função
+  calcular_custo_capital_rf(), testada isoladamente (R$ 10.000 a 12% a.a.
+  por 1 ano ≈ R$ 11.200, bateu certo), que compara o resultado da ação com
+  o que o mesmo dinheiro renderia investido no CDI. Documentado que essa
+  comparação usa a taxa de CDI ATUAL como aproximação constante desde cada
+  compra (não o histórico mês a mês completo) — a precisão melhora quanto
+  mais completo for o cadastro em "9. Índices Macroeconômicos".
+- v3.2 (2026-07-03): Analisada a aba "CARTEIRA - ESTR.INV.GRADUAL" da
+  planilha antiga do usuário para replicar o layout de exportação. Criada
+  gerar_excel_carteira() (openpyxl — já estava no requirements.txt, sem
+  dependência nova), testada isoladamente (gerou e releu o .xlsx com todas
+  as colunas corretas). Botão "📥 Gerar planilha desta carteira" + download
+  na aba Resultado. Adicionada a coluna pedida "Evolução % (sem dividendo)"
+  — evolução baseada só na variação de preço, sem somar os proventos (ao
+  contrário de "Evolução %", que já inclui os proventos recebidos) — tanto
+  na tela quanto na planilha exportada.
+- v3.3 (2026-07-03): Usuário perguntou a estrutura do arquivo de importação
+  de índices macro (pra trazer CDI desde jan/2016, IPCA desde jan/2014,
+  Ibovespa) e nesse processo descobri que a tela "9. Índices
+  Macroeconômicos" prometia um "template padronizado (baixe abaixo)" que
+  nunca existia de verdade — bug antigo, anterior às minhas alterações.
+  Criada gerar_template_indice() e conectado o botão "📥 Baixar template" de
+  verdade; testado gerando o arquivo e relendo com o mesmo parser que o
+  app usa pra importar, confirmando que os dados batem. Recomendado ao
+  usuário trazer também Selic (usada no WACC do FCD) além do que já pediu,
+  e sugerido considerar Ibovespa desde 2016 (não só 2024) já que há
+  posições da carteira antiga desde essa época.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -689,6 +723,131 @@ _MAPA_INDICES_YF = {
     "DOLAR": "BRL=X", "DÓLAR": "BRL=X", "USD": "BRL=X", "USDBRL": "BRL=X",
     "USDBRL=X": "BRL=X", "EUR": "EURBRL=X",
 }
+
+
+def gerar_template_indice(nome_indice="CDI"):
+    """
+    Gera o arquivo-modelo pra importar série histórica de índice — a tela
+    já prometia isso ("baixe abaixo") mas o botão nunca tinha sido criado.
+    Layout: linha 1 = nome do índice, linha 2 = cabeçalho, linha 3+ = exemplo.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Serie"
+    ws["A1"] = nome_indice
+    ws["A1"].font = Font(bold=True, size=12, name="Arial")
+
+    cabecalho = ["Ano", "Mês", "No mês", "Em 3 meses", "Em 6 meses", "No Ano", "Em 12 meses"]
+    for j, c in enumerate(cabecalho, start=1):
+        cel = ws.cell(row=2, column=j, value=c)
+        cel.font = Font(bold=True, color="FFFFFF", name="Arial")
+        cel.fill = PatternFill("solid", start_color="305496")
+
+    # linha de exemplo pra deixar claro o formato esperado
+    exemplo = [2016, 1, 1.05, 3.10, 6.25, 1.05, 13.20]
+    for j, v in enumerate(exemplo, start=1):
+        ws.cell(row=3, column=j, value=v)
+    ws.cell(row=4, column=1, value="(apague a linha de exemplo antes de importar)")
+
+    for col, largura in zip("ABCDEFG", [8, 6, 10, 12, 12, 10, 12]):
+        ws.column_dimensions[col].width = largura
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def gerar_excel_carteira(linhas, nome_carteira, totais):
+    """
+    Gera a planilha da carteira no mesmo espírito do modelo antigo do
+    usuário ("CARTEIRA - ESTR.INV.GRADUAL"): uma linha por ação com preço
+    médio, quantidade, total investido, proventos, custo do capital etc.,
+    mais a coluna extra "Evolução % (sem dividendo)". Retorna os bytes do
+    .xlsx, prontos pra um st.download_button.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Carteira"
+
+    ws["A1"] = f"Carteira: {nome_carteira}"
+    ws["A1"].font = Font(bold=True, size=14, name="Arial")
+    ws["A2"] = f"Gerado em {pd.Timestamp.now().strftime('%d/%m/%Y %H:%M')}"
+    ws["A2"].font = Font(italic=True, size=9, name="Arial")
+
+    df = pd.DataFrame(linhas)
+    colunas = list(df.columns)
+    linha_cab = 4
+    for j, col in enumerate(colunas, start=1):
+        c = ws.cell(row=linha_cab, column=j, value=col)
+        c.font = Font(bold=True, color="FFFFFF", name="Arial")
+        c.fill = PatternFill("solid", start_color="305496")
+        c.alignment = Alignment(horizontal="center")
+
+    colunas_moeda = {"Preço Atual","Prov.Ant.","Preço Médio","Total Investido","Total Atual",
+                      "Resultado (R$)","Custo do Capital (RF)"}
+    colunas_pct = {"Evolução %","Evolução % (sem dividendo)","DY %"}
+    for i, row in df.iterrows():
+        for j, col in enumerate(colunas, start=1):
+            valor = row[col]
+            c = ws.cell(row=linha_cab+1+i, column=j, value=valor)
+            c.font = Font(name="Arial")
+            if col in colunas_moeda and pd.notna(valor):
+                c.number_format = 'R$ #,##0.00;[RED]-R$ #,##0.00'
+            elif col in colunas_pct and pd.notna(valor):
+                c.number_format = '0.00"%"'
+
+    linha_tot = linha_cab + len(df) + 2
+    ws.cell(row=linha_tot, column=1, value="TOTAL").font = Font(bold=True, name="Arial")
+    for chave, col_nome in [("Total Investido","Total Investido"),("Total Atual","Total Atual"),("Resultado","Resultado (R$)")]:
+        if col_nome in colunas:
+            j = colunas.index(col_nome) + 1
+            c = ws.cell(row=linha_tot, column=j, value=totais.get(chave))
+            c.font = Font(bold=True, name="Arial")
+            c.number_format = 'R$ #,##0.00;[RED]-R$ #,##0.00'
+
+    for j, col in enumerate(colunas, start=1):
+        largura = max(12, len(str(col)) + 2)
+        ws.column_dimensions[get_column_letter(j)].width = largura
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def calcular_custo_capital_rf(movs_l, cdi_anual_pct):
+    """
+    Aproxima o "Custo do Capital (RF)" do modelo de planilha do usuário:
+    quanto o dinheiro de cada compra teria valido se, em vez da ação,
+    tivesse sido aplicado numa renda fixa rendendo o CDI (juros compostos
+    desde a data da compra até hoje).
+    APROXIMAÇÃO: usa a taxa de CDI atual (cadastrada em '9. Índices
+    Macroeconômicos') como se fosse constante durante todo o período —
+    não é o histórico mês a mês real do CDI. Quanto mais próxima a data de
+    compra de hoje, menor o efeito dessa simplificação.
+    Retorna o valor que o capital renderia em RF (não a diferença).
+    """
+    total_rf = 0.0
+    hoje = date.today()
+    for m in movs_l:
+        if m.get("tipo") != "compra":
+            continue
+        try:
+            data_compra = pd.to_datetime(m["data"]).date()
+        except Exception:
+            continue
+        anos = max((hoje - data_compra).days / 365.25, 0)
+        valor_compra = (m.get("quantidade") or 0) * (m.get("preco_unitario") or 0) + (m.get("taxas") or 0)
+        total_rf += valor_compra * ((1 + cdi_anual_pct/100) ** anos)
+    return total_rf
 
 
 def formatar_br(valor, tipo="numero", casas=2):
@@ -2417,6 +2576,11 @@ elif pagina == "6. Carteira":
                                 msg_ok=f"✅ Preço de {tk} atualizado manualmente.",
                                 msg_erro=f"❌ Não foi possível salvar o preço de {tk}.")
                 linhas = []
+                sb_cdi = get_supabase()
+                try:
+                    cdi_anual_c, _selic_c = calc.buscar_cdi_selic_atual(sb_cdi)
+                except Exception:
+                    cdi_anual_c = 0.0
                 for eid in eids:
                     tk_r = sb_select("empresas","ticker,razao_social",filtros={"id":eid})
                     if not tk_r: continue
@@ -2434,11 +2598,25 @@ elif pagina == "6. Carteira":
                     ta = apur["valor_mercado_atual"] + prov_ano + prov_ant
                     res = ta - ti
                     ev = round(res/ti*100,2) if ti else None
+                    ev_sem_div = round((apur["valor_mercado_atual"]-ti)/ti*100,2) if ti else None
                     dy = round(prov_ano/apur["valor_mercado_atual"]*100,2) if apur["valor_mercado_atual"] else None
-                    linhas.append({"Ação":tk,"Preço Atual":preco_a,"Prov.Ant.":prov_ant,f"Prov.{ano}":prov_ano,"Qtd":apur["quantidade_atual"],"Preço Médio":round(apur["preco_medio"],2),"Total Investido":ti,"Total Atual":round(ta,2),"Resultado (R$)":round(res,2),"Evolução %":ev,"DY %":dy})
+                    num_op = len(movs_l)
+                    valor_rf = calcular_custo_capital_rf(movs_l, cdi_anual_c)
+                    custo_capital = round(ta - valor_rf, 2)
+                    linhas.append({"Ação":tk,"Preço Atual":preco_a,"Prov.Ant.":prov_ant,f"Prov.{ano}":prov_ano,
+                                   "Qtd":apur["quantidade_atual"],"Preço Médio":round(apur["preco_medio"],2),
+                                   "Nº Operações": num_op, "Total Investido":ti,"Total Atual":round(ta,2),
+                                   "Resultado (R$)":round(res,2),"Evolução %":ev,
+                                   "Evolução % (sem dividendo)": ev_sem_div, "DY %":dy,
+                                   "Custo do Capital (RF)": custo_capital})
                 if linhas:
                     df_r = pd.DataFrame(linhas)
+                    df_r["Distrib. Atual %"] = round(df_r["Total Atual"] / df_r["Total Atual"].sum() * 100, 2) if df_r["Total Atual"].sum() else 0
                     st.dataframe(df_r, use_container_width=True)
+                    st.caption("💡 'Custo do Capital (RF)' compara o resultado atual com o que o dinheiro "
+                               f"renderia se tivesse sido aplicado no CDI ({formatar_br(cdi_anual_c,'percentual',2)} a.a., "
+                               "taxa atual usada como aproximação constante desde cada compra) — negativo "
+                               "significa que a ação rendeu menos que a renda fixa nesse período.")
                     t_inv = sum(l["Total Investido"] for l in linhas)
                     t_at = sum(l["Total Atual"] for l in linhas)
                     r_at = t_at - t_inv
@@ -2448,6 +2626,21 @@ elif pagina == "6. Carteira":
                     c2.metric("Total Atual",formatar_br(t_at,"moeda"))
                     c3.metric("Resultado",formatar_br(r_at,"moeda"))
                     c4.metric("Evolução",f"{ev_total:.2f}%" if ev_total else "—")
+
+                    if st.button("📥 Gerar planilha desta carteira"):
+                        with st.spinner("Gerando planilha..."):
+                            try:
+                                xlsx_bytes = gerar_excel_carteira(linhas, cart_nome,
+                                    {"Total Investido": t_inv, "Total Atual": t_at, "Resultado": r_at})
+                                st.session_state["xlsx_carteira_bytes"] = xlsx_bytes
+                                st.session_state["xlsx_carteira_nome"] = f"carteira_{cart_nome}.xlsx"
+                            except Exception as e:
+                                st.error(f"❌ Não foi possível gerar a planilha: {e}")
+                    if "xlsx_carteira_bytes" in st.session_state:
+                        st.download_button("⬇️ Baixar planilha (.xlsx)", data=st.session_state["xlsx_carteira_bytes"],
+                            file_name=st.session_state.get("xlsx_carteira_nome","carteira.xlsx"),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
                     st.markdown("---")
                     st.subheader("🧭 Analisar uma ação da carteira")
                     tk_an = st.selectbox("Ação",[l["Ação"] for l in linhas],key="cart_anal")
@@ -2741,6 +2934,12 @@ elif pagina == "9. Índices Macroeconômicos":
                    "O nome do índice fica na célula A1 da planilha. Campos opcionais podem ficar em branco.")
 
         indicador_imp = st.selectbox("Qual índice você está importando?", INDICES_LISTA, key="imp_idx_nome")
+
+        template_bytes = gerar_template_indice(indicador_imp)
+        st.download_button(f"📥 Baixar template ({indicador_imp})", data=template_bytes,
+            file_name=f"template_{indicador_imp.lower()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
         arq_i = st.file_uploader("Selecione o arquivo Excel (.xlsx)", type=["xlsx"], key="idx_up")
 
         if arq_i:
