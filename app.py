@@ -1,10 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v3.4
-GERADO EM: 2026-07-04 02:51 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Corrigido preço atual da carteira não atualizando — mesmo
-bug de INSERT-em-vez-de-UPDATE, agora em cotacao_atual_manual.
+VERSÃO DESTE ARQUIVO: v3.6
+GERADO EM: 2026-07-04 03:14 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Novo seletor de empresa na Carteira que nunca deixa
+registrar histórico sob uma empresa errada por padrão — ou escolhe uma
+empresa de verdade, ou cadastra na hora.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -233,6 +234,30 @@ HISTÓRICO:
   UPDATE ou INSERT), testada isoladamente, e aplicada nos dois lugares que
   gravam cotação: o botão de busca automática em lote e o ajuste manual
   por ação.
+- v3.5 (2026-07-04): Usuário registrou a mesma operação 2x sem querer e não
+  tinha como corrigir. Aba Histórico da Carteira reformulada: formulário de
+  registro agora limpa os campos após salvar (clear_on_submit); a tabela
+  ganhou filtros (tipo, ano) e limite de registros exibidos (pensando em
+  carteiras com centenas de operações, sem travar a tela renderizando tudo
+  de uma vez); abaixo da tabela, um seletor de registro com formulário de
+  edição pré-preenchido ("💾 Salvar alteração") e botão "🗑️ Excluir este
+  registro" — usando os mesmos padrões seguros de UPDATE/DELETE já
+  estabelecidos no resto do app. Também renomeada a aba "📊 Resultado" para
+  "📊 Carteira de Ações", por sugestão do usuário (o nome antigo não dizia
+  o que tinha dentro).
+- v3.6 (2026-07-04): Achada a causa raiz de "minha carteira tem 2 ações mas
+  só aparece 1 no resultado": selecionar_empresa() sempre vinha com uma
+  empresa PRÉ-SELECIONADA por padrão (índice 0). Quando o usuário tentou
+  lançar operações de uma ação que nunca tinha sido cadastrada, ela não
+  aparecia na lista, e o formulário ficou silenciosamente registrando tudo
+  sob a primeira empresa da lista sem ele perceber. Criada
+  selecionar_ou_cadastrar_empresa(): a primeira opção agora é sempre
+  "➕ Empresa não está na lista — cadastrar agora" (nunca uma empresa
+  pré-escolhida), com um cadastro rápido (ticker + razão social) ali mesmo
+  — sem precisar passar pelo Screening ou pela análise completa antes de
+  poder registrar uma compra. Aplicada nas abas Histórico e Proventos da
+  Carteira. Recomendado ao usuário usar a edição/exclusão da v3.5 pra
+  corrigir os registros que ficaram sob a empresa errada.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -1433,6 +1458,50 @@ def selecionar_empresa(label="Ação", key=None):
     ticker = opcao.split(" - ")[0]
     return df[df["ticker"] == ticker].iloc[0]
 
+
+def selecionar_ou_cadastrar_empresa(label="Ação", key=None):
+    """
+    Como selecionar_empresa(), mas pensada para telas onde escolher a
+    empresa ERRADA por engano é um risco real (ex.: lançar histórico de
+    carteira) — existe porque um usuário lançou operações de uma ação que
+    nunca tinha sido cadastrada, e o seletor comum, sem opção pra isso,
+    acabou deixando tudo registrado sob a primeira empresa da lista sem
+    ninguém perceber.
+    Em vez de vir com uma empresa pré-selecionada por padrão, a primeira
+    opção é sempre "➕ Empresa não está na lista — cadastrar agora", que
+    abre um cadastro rápido (só ticker + razão social) ali mesmo. Só depois
+    de cadastrar (ou de escolher uma empresa de verdade) é que devolve algo
+    diferente de None.
+    """
+    df = lista_empresas()
+    opcao_nova = "➕ Empresa não está na lista — cadastrar agora"
+    opcoes = [opcao_nova] + (list(df["ticker"] + " - " + df["razao_social"]) if not df.empty else [])
+    opcao = st.selectbox(label, opcoes, index=0, key=key)
+
+    if opcao == opcao_nova:
+        with st.form(f"form_cadastro_rapido_{key}"):
+            st.caption("Cadastro rápido — depois complete o resto dos dados na tela '1. Empresas e Setores'.")
+            nc1, nc2 = st.columns(2)
+            novo_tk = nc1.text_input("Ticker (ex: XPTO3)", key=f"novo_tk_{key}")
+            novo_rz = nc2.text_input("Razão social (opcional)", key=f"novo_rz_{key}")
+            if st.form_submit_button("➕ Cadastrar e continuar"):
+                if not novo_tk.strip():
+                    st.error("❌ Digite o ticker antes de cadastrar.")
+                else:
+                    r = gravar_com_confirmacao(sb_insert, "empresas", {
+                        "ticker": novo_tk.strip().upper(),
+                        "razao_social": novo_rz.strip() or novo_tk.strip().upper(),
+                        "ativo": True,
+                    }, msg_ok=f"✅ Empresa {novo_tk.strip().upper()} cadastrada — selecione ela na lista agora.",
+                       msg_erro="❌ Não foi possível cadastrar a empresa.")
+                    if r:
+                        st.rerun()
+        return None
+
+    ticker = opcao.split(" - ")[0]
+    return df[df["ticker"] == ticker].iloc[0]
+
+
 def iniciar_fluxo_analise(empresa_id):
     st.session_state["fluxo_empresa_id"] = int(empresa_id)
     st.session_state["fluxo_step"] = 1
@@ -2495,7 +2564,7 @@ elif pagina == "6. Carteira":
         cart_nome = st.selectbox("Carteira", cart_df["nome"])
         cart_id = int(cart_df[cart_df["nome"]==cart_nome]["id"].iloc[0])
 
-        aba_imp,aba_res,aba_hist,aba_prov = st.tabs(["📥 Importar Excel","📊 Resultado","🔁 Histórico","💰 Proventos"])
+        aba_imp,aba_res,aba_hist,aba_prov = st.tabs(["📥 Importar Excel","📊 Carteira de Ações","🔁 Histórico","💰 Proventos"])
 
         with aba_imp:
             st.write("Arquivo .xlsx com colunas: **CNPJ** (opcional), **Código da Ação**, **Quantidade**, **Valor Médio**.")
@@ -2676,9 +2745,10 @@ elif pagina == "6. Carteira":
                         if eid_an: iniciar_fluxo_analise(eid_an[0]["id"])
 
         with aba_hist:
-            empresa = selecionar_empresa("Ação",key="hist_emp")
+            st.subheader("Registrar nova operação")
+            empresa = selecionar_ou_cadastrar_empresa("Ação",key="hist_emp")
             if empresa is not None:
-                with st.form("form_mov"):
+                with st.form("form_mov", clear_on_submit=True):
                     c1,c2,c3,c4 = st.columns(4)
                     tipo = c1.selectbox("Tipo",["compra","venda"])
                     data_m = c2.text_input("Data",str(date.today()))
@@ -2694,11 +2764,70 @@ elif pagina == "6. Carteira":
                             msg_ok="✅ Operação registrada com sucesso.", msg_erro="❌ Não foi possível registrar a operação.")
                         if r:
                             st.rerun()
-                movs = sb_select("movimentos_carteira","tipo,data,quantidade,preco_unitario,taxas,total_operacao",filtros={"carteira_id":cart_id,"empresa_id":int(empresa["id"])},ordem="data")
-                st.dataframe(pd.DataFrame(movs), use_container_width=True)
+
+                st.markdown("---")
+                st.subheader(f"Histórico de operações — {empresa['ticker']}")
+                fc1, fc2, fc3 = st.columns(3)
+                filtro_tipo_mov = fc1.selectbox("Filtrar por tipo", ["Todos","compra","venda"], key="filtro_tipo_mov")
+                filtro_ano_mov = fc2.text_input("Filtrar por ano (ex: 2026, opcional)", key="filtro_ano_mov")
+                limite_mov = fc3.number_input("Mostrar últimos N registros", min_value=10, max_value=1000, value=50, step=10, key="limite_mov")
+
+                movs = sb_select("movimentos_carteira","id,tipo,data,quantidade,preco_unitario,taxas,total_operacao",
+                                  filtros={"carteira_id":cart_id,"empresa_id":int(empresa["id"])},ordem="data")
+                df_movs = pd.DataFrame(movs) if movs else pd.DataFrame()
+
+                if df_movs.empty:
+                    st.caption("Nenhuma operação registrada ainda para esta ação.")
+                else:
+                    df_filtrado = df_movs.copy()
+                    if filtro_tipo_mov != "Todos":
+                        df_filtrado = df_filtrado[df_filtrado["tipo"] == filtro_tipo_mov]
+                    if filtro_ano_mov.strip():
+                        df_filtrado = df_filtrado[df_filtrado["data"].astype(str).str.startswith(filtro_ano_mov.strip())]
+                    df_filtrado = df_filtrado.sort_values("data", ascending=False).head(int(limite_mov))
+
+                    st.dataframe(df_filtrado.drop(columns=["id"]), use_container_width=True, height=350, hide_index=True)
+                    st.caption(f"Mostrando {len(df_filtrado)} de {len(df_movs)} registro(s) no total "
+                               "(mais recentes primeiro). Ajuste os filtros acima pra ver outros.")
+
+                    if not df_filtrado.empty:
+                        st.markdown("---")
+                        st.subheader("✏️ Editar ou 🗑️ excluir um registro")
+                        registros_dict = df_filtrado.to_dict("records")
+                        opcoes_mov = {f"{m['data']} — {m['tipo']} — {m['quantidade']}x R$ {m['preco_unitario']} (id {m['id']})": m['id']
+                                      for m in registros_dict}
+                        escolha_mov = st.selectbox("Selecione o registro", list(opcoes_mov.keys()), key="escolha_mov_edit")
+                        mov_id_sel = opcoes_mov[escolha_mov]
+                        mov_atual = next(m for m in registros_dict if m["id"] == mov_id_sel)
+
+                        with st.form("form_editar_mov"):
+                            ec1,ec2,ec3,ec4 = st.columns(4)
+                            e_tipo = ec1.selectbox("Tipo",["compra","venda"], index=["compra","venda"].index(mov_atual["tipo"]))
+                            e_data = ec2.text_input("Data", mov_atual["data"])
+                            e_qtd = ec3.number_input("Quantidade", value=float(mov_atual["quantidade"]))
+                            e_preco = ec4.number_input("Preço unitário", value=float(mov_atual["preco_unitario"]))
+                            e_taxas = st.number_input("Taxas", value=float(mov_atual.get("taxas") or 0))
+                            ebtn1, ebtn2 = st.columns(2)
+                            salvar_edicao = ebtn1.form_submit_button("💾 Salvar alteração", type="primary")
+                            excluir_registro = ebtn2.form_submit_button("🗑️ Excluir este registro")
+
+                            if salvar_edicao:
+                                e_tot = e_qtd*e_preco + (e_taxas if e_tipo=="compra" else -e_taxas)
+                                r = gravar_com_confirmacao(sb_update, "movimentos_carteira",
+                                    {"tipo":e_tipo,"data":e_data,"quantidade":e_qtd,"preco_unitario":e_preco,
+                                     "taxas":e_taxas,"total_operacao":e_tot}, {"id": mov_id_sel},
+                                    msg_ok="✅ Operação atualizada com sucesso.", msg_erro="❌ Não foi possível atualizar a operação.")
+                                if r:
+                                    st.rerun()
+                            if excluir_registro:
+                                r = gravar_com_confirmacao(sb_delete, "movimentos_carteira", {"id": mov_id_sel},
+                                    msg_ok="✅ Registro excluído com sucesso.", msg_erro="❌ Não foi possível excluir o registro.",
+                                    permitir_vazio=True)
+                                if r:
+                                    st.rerun()
 
         with aba_prov:
-            empresa_p = selecionar_empresa("Ação do provento",key="prov_emp")
+            empresa_p = selecionar_ou_cadastrar_empresa("Ação do provento",key="prov_emp")
             if empresa_p is not None:
                 with st.form("form_prov"):
                     c1,c2,c3 = st.columns(3)
