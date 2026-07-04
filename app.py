@@ -1,10 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v3.3
-GERADO EM: 2026-07-03 18:20 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Corrigido o botão de template de importação de índices, que
-a tela prometia mas nunca existia de verdade.
+VERSÃO DESTE ARQUIVO: v3.4
+GERADO EM: 2026-07-04 02:51 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Corrigido preço atual da carteira não atualizando — mesmo
+bug de INSERT-em-vez-de-UPDATE, agora em cotacao_atual_manual.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -223,6 +223,16 @@ HISTÓRICO:
   usuário trazer também Selic (usada no WACC do FCD) além do que já pediu,
   e sugerido considerar Ibovespa desde 2016 (não só 2024) já que há
   posições da carteira antiga desde essa época.
+- v3.4 (2026-07-04): Usuário reportou preço atual da B3SA3 na Carteira
+  continuando em 0,00 mesmo após "Buscar cotações automáticas". Confirmado
+  ser o MESMO bug de INSERT-em-vez-de-UPDATE já visto em empresas.rating,
+  balancos_dre e indice_boa_empresa — agora em cotacao_atual_manual: como
+  já existia uma linha pra (carteira_id, empresa_id), o sb_upsert falhava
+  (ou silenciosamente não gravava) em vez de atualizar. Criada
+  salvar_cotacao_atual() com o mesmo padrão seguro (verifica se existe,
+  UPDATE ou INSERT), testada isoladamente, e aplicada nos dois lugares que
+  gravam cotação: o botão de busca automática em lote e o ajuste manual
+  por ação.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -723,6 +733,28 @@ _MAPA_INDICES_YF = {
     "DOLAR": "BRL=X", "DÓLAR": "BRL=X", "USD": "BRL=X", "USDBRL": "BRL=X",
     "USDBRL=X": "BRL=X", "EUR": "EURBRL=X",
 }
+
+
+def salvar_cotacao_atual(carteira_id, empresa_id, preco, data_hora, msg_ok=None, msg_erro=None):
+    """
+    Salva o preço atual de uma ação numa carteira fazendo UPDATE se já
+    existir uma linha pra essa (carteira_id, empresa_id), ou INSERT se não
+    existir. Mesmo problema já visto em balancos_dre/rating/índice de boa
+    empresa: sb_upsert tentava sempre INSERIR, batendo em
+    "duplicate key value violates unique constraint" (ou falhando em
+    silêncio) sempre que a ação já tinha uma cotação salva antes.
+    """
+    payload = {"carteira_id": carteira_id, "empresa_id": empresa_id,
+               "preco_atual": preco, "data_atualizacao": data_hora}
+    existente = sb_select("cotacao_atual_manual", "id", filtros={"carteira_id": carteira_id, "empresa_id": empresa_id})
+    if existente:
+        return gravar_com_confirmacao(sb_update, "cotacao_atual_manual", payload, {"id": existente[0]["id"]},
+            msg_ok=msg_ok or "✅ Cotação atualizada com sucesso.",
+            msg_erro=msg_erro or "❌ Não foi possível atualizar a cotação.")
+    else:
+        return gravar_com_confirmacao(sb_insert, "cotacao_atual_manual", payload,
+            msg_ok=msg_ok or "✅ Cotação salva com sucesso.",
+            msg_erro=msg_erro or "❌ Não foi possível salvar a cotação.")
 
 
 def gerar_template_indice(nome_indice="CDI"):
@@ -2539,10 +2571,7 @@ elif pagina == "6. Carteira":
                             for eid, tk in emps_map.items():
                                 preco, agora = buscar_cotacao_tempo_real(tk)
                                 if preco > 0:
-                                    res = sb_upsert("cotacao_atual_manual", {
-                                        "carteira_id": cart_id, "empresa_id": eid,
-                                        "preco_atual": preco, "data_atualizacao": agora,
-                                    })
+                                    res = salvar_cotacao_atual(cart_id, eid, preco, agora)
                                     ok_count += 1 if res else 0
                                     falha_count += 0 if res else 1
                                 else:
@@ -2570,9 +2599,7 @@ elif pagina == "6. Carteira":
                                 pass
                         novo = cols[i%4].number_input(label,value=v0,key=f"p_{eid}")
                         if novo>0 and novo != v0:
-                            r_cot = gravar_com_confirmacao(sb_upsert, "cotacao_atual_manual",
-                                {"carteira_id":cart_id,"empresa_id":eid,"preco_atual":novo,
-                                 "data_atualizacao":pd.Timestamp.now().isoformat()},
+                            r_cot = salvar_cotacao_atual(cart_id, eid, novo, pd.Timestamp.now().isoformat(),
                                 msg_ok=f"✅ Preço de {tk} atualizado manualmente.",
                                 msg_erro=f"❌ Não foi possível salvar o preço de {tk}.")
                 linhas = []
