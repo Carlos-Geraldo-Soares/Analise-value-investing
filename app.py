@@ -1,11 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v3.6
-GERADO EM: 2026-07-04 03:14 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Novo seletor de empresa na Carteira que nunca deixa
-registrar histórico sob uma empresa errada por padrão — ou escolhe uma
-empresa de verdade, ou cadastra na hora.
+VERSÃO DESTE ARQUIVO: v3.7
+GERADO EM: 2026-07-10 22:33 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Filtros do Screening bloqueiam valores negativos em P/L,
+P/VP, Dív/PL, EV/EBITDA, P/EBITDA; exige pelo menos 1 filtro ativo.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -258,6 +257,17 @@ HISTÓRICO:
   poder registrar uma compra. Aplicada nas abas Histórico e Proventos da
   Carteira. Recomendado ao usuário usar a edição/exclusão da v3.5 pra
   corrigir os registros que ficaram sob a empresa errada.
+- v3.7 (2026-07-10): Usuário reportou P/L negativo passando num filtro
+  "P/L ≤ 15" — matematicamente correto (qualquer negativo é ≤ 15), mas não
+  é o que se quer numa triagem de value investing (negativo = prejuízo).
+  Confirmado que o E/AND já funcionava certo (o Div.Yield só não filtrou
+  porque estava desativado no print). Adicionado bloqueio de valores
+  negativos para P/L, P/VP, Dív/PL, EV/EBITDA e P/EBITDA sempre que o
+  sinal "≤" for usado (usuário confirmou incluir Dív/PL mesmo sabendo que
+  isso pode excluir empresas com caixa líquido positivo). Também adicionada
+  exigência de pelo menos 1 filtro ativo (básico, avançado ou por
+  atributo) antes de permitir a busca, evitando trazer as 994 ações de
+  uma vez sem critério nenhum.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -1595,83 +1605,97 @@ if pagina == "0. Screening de Ações":
     col_btn2.caption("Busca todas as ações da B3 em tempo real — pode levar 10 a 30 segundos.")
 
     if buscar:
-        with st.spinner("Buscando todas as ações da B3 no Fundamentus... aguarde."):
-            try:
-                df_fund, colunas_ausentes = _buscar_fundamentus_bruto()
+        tem_filtro_numerico = any(cfg["ativo"] for cfg in st.session_state["filtros_screen"].values())
+        ft_check = st.session_state["filtros_texto_screen"]
+        tem_filtro_texto = bool(ft_check["cnpj"].strip() or ft_check["razao_social"].strip()
+                                 or ft_check["setor"] != "Todos" or ft_check["segmento"].strip())
+        if not tem_filtro_numerico and not tem_filtro_texto:
+            st.error("❌ Ative pelo menos 1 filtro (básico, avançado ou por atributo) antes de buscar — "
+                     "buscar sem nenhum critério traria as 994 ações da B3 de uma vez.")
+        else:
+            with st.spinner("Buscando todas as ações da B3 no Fundamentus... aguarde."):
+                try:
+                    df_fund, colunas_ausentes = _buscar_fundamentus_bruto()
 
-                if df_fund is None or df_fund.empty:
-                    st.error("O Fundamentus não retornou dados agora (site fora do ar, bloqueando o acesso "
-                              "ou mudou de layout novamente).")
-                    st.info("Tente novamente em alguns minutos.")
-                else:
-                    # enriquece com os dados que JÁ temos cadastrados (razão social, setor,
-                    # segmento, CNPJ) — o Fundamentus não traz isso na lista completa
-                    nossas_empresas = sb_select("empresas", "ticker,cnpj,razao_social,setor_id,segmento") or []
-                    setores_map = {s["id"]: s["nome"] for s in (sb_select("setores","id,nome") or [])}
-                    df_nossas = pd.DataFrame(nossas_empresas)
-                    if not df_nossas.empty:
-                        df_nossas["setor_nome_cadastrado"] = df_nossas["setor_id"].map(setores_map)
-                        df_nossas = df_nossas.rename(columns={"razao_social":"razao_social_cadastrada",
-                                                                "cnpj":"cnpj_cadastrado",
-                                                                "segmento":"segmento_cadastrado"})
-                        df_fund = df_fund.merge(
-                            df_nossas[["ticker","cnpj_cadastrado","razao_social_cadastrada",
-                                       "setor_nome_cadastrado","segmento_cadastrado"]],
-                            on="ticker", how="left")
+                    if df_fund is None or df_fund.empty:
+                        st.error("O Fundamentus não retornou dados agora (site fora do ar, bloqueando o acesso "
+                                  "ou mudou de layout novamente).")
+                        st.info("Tente novamente em alguns minutos.")
                     else:
-                        for c in ["cnpj_cadastrado","razao_social_cadastrada","setor_nome_cadastrado","segmento_cadastrado"]:
-                            df_fund[c] = None
-                    # usa o dado cadastrado quando existir; senão mantém o que o Fundamentus deu (0/vazio)
-                    df_fund["razao_social"] = df_fund["razao_social_cadastrada"].fillna(df_fund.get("razao_social", ""))
-                    df_fund["setor"] = df_fund["setor_nome_cadastrado"].fillna(df_fund.get("setor", ""))
-                    df_fund["cnpj"] = df_fund["cnpj_cadastrado"]
-                    df_fund["segmento"] = df_fund["segmento_cadastrado"]
+                        # enriquece com os dados que JÁ temos cadastrados (razão social, setor,
+                        # segmento, CNPJ) — o Fundamentus não traz isso na lista completa
+                        nossas_empresas = sb_select("empresas", "ticker,cnpj,razao_social,setor_id,segmento") or []
+                        setores_map = {s["id"]: s["nome"] for s in (sb_select("setores","id,nome") or [])}
+                        df_nossas = pd.DataFrame(nossas_empresas)
+                        if not df_nossas.empty:
+                            df_nossas["setor_nome_cadastrado"] = df_nossas["setor_id"].map(setores_map)
+                            df_nossas = df_nossas.rename(columns={"razao_social":"razao_social_cadastrada",
+                                                                    "cnpj":"cnpj_cadastrado",
+                                                                    "segmento":"segmento_cadastrado"})
+                            df_fund = df_fund.merge(
+                                df_nossas[["ticker","cnpj_cadastrado","razao_social_cadastrada",
+                                           "setor_nome_cadastrado","segmento_cadastrado"]],
+                                on="ticker", how="left")
+                        else:
+                            for c in ["cnpj_cadastrado","razao_social_cadastrada","setor_nome_cadastrado","segmento_cadastrado"]:
+                                df_fund[c] = None
+                        # usa o dado cadastrado quando existir; senão mantém o que o Fundamentus deu (0/vazio)
+                        df_fund["razao_social"] = df_fund["razao_social_cadastrada"].fillna(df_fund.get("razao_social", ""))
+                        df_fund["setor"] = df_fund["setor_nome_cadastrado"].fillna(df_fund.get("setor", ""))
+                        df_fund["cnpj"] = df_fund["cnpj_cadastrado"]
+                        df_fund["segmento"] = df_fund["segmento_cadastrado"]
 
-                    if colunas_ausentes:
-                        st.warning("⚠️ O Fundamentus não trouxe estes indicadores agora (foram preenchidos com 0): "
-                                   + ", ".join(sorted(set(colunas_ausentes))))
+                        if colunas_ausentes:
+                            st.warning("⚠️ O Fundamentus não trouxe estes indicadores agora (foram preenchidos com 0): "
+                                       + ", ".join(sorted(set(colunas_ausentes))))
 
-                    # aplicar filtros numéricos — tudo combinado com E; um indicador com
-                    # problema não derruba os demais
-                    filtros = st.session_state["filtros_screen"]
-                    mask = pd.Series([True] * len(df_fund), index=df_fund.index)
-                    for chave, cfg in filtros.items():
-                        if not cfg["ativo"] or chave not in df_fund.columns:
-                            continue
-                        try:
-                            val = cfg["valor"]
-                            sinal = cfg["sinal"]
-                            col_series = pd.to_numeric(df_fund[chave], errors="coerce").fillna(0)
-                            if sinal == "≤":
-                                mask &= col_series <= val
-                            elif sinal == "≥":
-                                mask &= col_series >= val
-                            elif sinal == "=":
-                                mask &= col_series == val
-                        except Exception:
-                            continue  # ignora só esse filtro, não trava a busca inteira
+                        # aplicar filtros numéricos — tudo combinado com E; um indicador com
+                        # problema não derruba os demais
+                        filtros = st.session_state["filtros_screen"]
+                        # nestes indicadores, um valor negativo é sinal de problema (prejuízo,
+                        # EBITDA negativo, patrimônio negativo) — nunca deve passar num filtro
+                        # "≤ X", mesmo que -300 seja matematicamente menor que 15
+                        _CAMPOS_SO_POSITIVO = {"pl", "pvp", "divpl", "evebitda", "pebitda"}
+                        mask = pd.Series([True] * len(df_fund), index=df_fund.index)
+                        for chave, cfg in filtros.items():
+                            if not cfg["ativo"] or chave not in df_fund.columns:
+                                continue
+                            try:
+                                val = cfg["valor"]
+                                sinal = cfg["sinal"]
+                                col_series = pd.to_numeric(df_fund[chave], errors="coerce").fillna(0)
+                                if sinal == "≤":
+                                    mask &= col_series <= val
+                                    if chave in _CAMPOS_SO_POSITIVO:
+                                        mask &= col_series > 0
+                                elif sinal == "≥":
+                                    mask &= col_series >= val
+                                elif sinal == "=":
+                                    mask &= col_series == val
+                            except Exception:
+                                continue  # ignora só esse filtro, não trava a busca inteira
 
-                    # aplicar filtros de texto/atributo — também combinados com E
-                    ft = st.session_state["filtros_texto_screen"]
-                    if ft["cnpj"].strip():
-                        alvo = re.sub(r"[^0-9]", "", ft["cnpj"])
-                        mask &= df_fund["cnpj"].astype(str).str.replace(r"[^0-9]", "", regex=True).str.contains(alvo, na=False)
-                    if ft["razao_social"].strip():
-                        mask &= df_fund["razao_social"].astype(str).str.lower().str.contains(ft["razao_social"].strip().lower(), na=False)
-                    if ft["setor"] != "Todos":
-                        mask &= df_fund["setor"].astype(str).str.contains(ft["setor"], case=False, na=False)
-                    if ft["segmento"].strip():
-                        mask &= df_fund["segmento"].astype(str).str.lower().str.contains(ft["segmento"].strip().lower(), na=False)
+                        # aplicar filtros de texto/atributo — também combinados com E
+                        ft = st.session_state["filtros_texto_screen"]
+                        if ft["cnpj"].strip():
+                            alvo = re.sub(r"[^0-9]", "", ft["cnpj"])
+                            mask &= df_fund["cnpj"].astype(str).str.replace(r"[^0-9]", "", regex=True).str.contains(alvo, na=False)
+                        if ft["razao_social"].strip():
+                            mask &= df_fund["razao_social"].astype(str).str.lower().str.contains(ft["razao_social"].strip().lower(), na=False)
+                        if ft["setor"] != "Todos":
+                            mask &= df_fund["setor"].astype(str).str.contains(ft["setor"], case=False, na=False)
+                        if ft["segmento"].strip():
+                            mask &= df_fund["segmento"].astype(str).str.lower().str.contains(ft["segmento"].strip().lower(), na=False)
 
-                    df_result = df_fund[mask].copy()
+                        df_result = df_fund[mask].copy()
 
-                    st.session_state["screening_resultado_fund"] = df_result
-                    st.session_state["screening_total_fund"] = len(df_fund)
+                        st.session_state["screening_resultado_fund"] = df_result
+                        st.session_state["screening_total_fund"] = len(df_fund)
 
-            except Exception as e:
-                st.error(f"Erro ao buscar dados no Fundamentus: {e}")
-                st.info("Verifique se o Streamlit Cloud tem acesso à internet para o Fundamentus. "
-                        "Se o erro persistir, tente novamente em alguns minutos.")
+                except Exception as e:
+                    st.error(f"Erro ao buscar dados no Fundamentus: {e}")
+                    st.info("Verifique se o Streamlit Cloud tem acesso à internet para o Fundamentus. "
+                            "Se o erro persistir, tente novamente em alguns minutos.")
 
     if "screening_resultado_fund" in st.session_state:
         df_result = st.session_state["screening_resultado_fund"]
