@@ -1,10 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v3.8
-GERADO EM: 2026-07-10 22:49 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Corrigido "Minha Lista de Análise" sempre vazia pra contas
-comuns — usuario_id nem estava sendo buscado do banco.
+VERSÃO DESTE ARQUIVO: v4.0
+GERADO EM: 2026-07-10 23:00 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Cadastro em lote no Screening ganhou intervalo entre
+buscas (evita bloqueio do Fundamentus); novo botão pra corrigir razão
+social/setor incompletos.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -276,6 +277,32 @@ HISTÓRICO:
   que pula esse filtro). Corrigido incluindo usuario_id na consulta e
   passando o filtro direto pro sb_select (mesmo padrão já usado e correto
   em minhas_carteiras()), em vez de filtrar depois em Python.
+- v3.9 (2026-07-10): Dois bugs achados ao testar "0b. Minha Lista de
+  Análise": (1) PETR4 "voltava" depois de removida — o "Guardar seleção"
+  no Screening sempre INSERIA um registro novo em lista_analise em vez de
+  verificar se já existia um pra aquela empresa+usuário, criando
+  duplicatas (remover uma não removia a outra). Corrigido com o mesmo
+  padrão seguro (verifica se existe → UPDATE ou INSERT). (2) Tela vermelha
+  real (StreamlitAPIException) ao clicar "Iniciar Fluxo de Análise guiado"
+  a partir da Lista — iniciar_fluxo_analise() tentava escrever direto em
+  st.session_state["nav_radio"] depois do widget do menu lateral já ter
+  sido desenhado nessa mesma rodada do script, o que o Streamlit não
+  permite mais. Corrigido usando um campo separado (_nav_pendente) que é
+  aplicado ANTES do widget ser criado, na rodada seguinte — conferido que
+  não existe nenhum outro lugar no código escrevendo direto em
+  nav_radio.
+- v4.0 (2026-07-10): ALLD3/BNBR3/RIAA3/BSLI4 ficaram cadastradas sem razão
+  social/setor mesmo o Fundamentus tendo essa informação (confirmado pelo
+  usuário com print da página do Fundamentus mostrando "Empresa: ALLIED ON
+  NM, Setor: Comércio" pra ALLD3). Causa provável: pedidos em sequência
+  rápida demais ao guardar várias ações de uma vez no Screening, sofrendo
+  bloqueio/limite temporário do Fundamentus — o erro ficava engolido pelo
+  "except: return {}" da função. Adicionado intervalo de 1,2s entre pedidos
+  no cadastro em lote, aviso explícito listando quais tickers vieram
+  incompletos, e um novo botão "🔎 Buscar dados no Fundamentus" na tela de
+  Empresas (aparece quando razão social ainda está igual ao ticker ou o
+  setor está vazio) pra corrigir retroativamente sem precisar apagar e
+  recriar a empresa.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -309,6 +336,13 @@ if "_flash" in st.session_state:
         st.success(_msg_flash)
     else:
         st.error(_msg_flash)
+
+# Aplica um pedido de troca de tela vindo de iniciar_fluxo_analise() —
+# TEM que rodar antes do widget do menu ser criado logo abaixo, senão o
+# Streamlit recusa a mudança (StreamlitAPIException: widget já criado).
+if "_nav_pendente" in st.session_state:
+    st.session_state["nav_radio"] = st.session_state.pop("_nav_pendente")
+
 pagina = st.sidebar.radio("Navegação", [
     "0. Screening de Ações",
     "0b. Minha Lista de Análise",
@@ -335,6 +369,7 @@ if pagina != "🧭 Fluxo de Análise (guiado)":
 
 import re
 import io
+import time
 import unicodedata
 import requests
 
@@ -1524,7 +1559,14 @@ def iniciar_fluxo_analise(empresa_id):
     st.session_state["fluxo_empresa_id"] = int(empresa_id)
     st.session_state["fluxo_step"] = 1
     st.session_state["_fluxo_ativo_confirmado"] = True
-    st.session_state["nav_radio"] = "🧭 Fluxo de Análise (guiado)"
+    # não dá pra escrever direto em st.session_state["nav_radio"] aqui — o
+    # widget do menu lateral já foi desenhado nesta mesma rodada do script,
+    # e o Streamlit bloqueia mudar o valor de um widget depois dele já ter
+    # sido criado (dava StreamlitAPIException). Em vez disso, guarda um
+    # pedido de navegação num campo separado, que é aplicado ANTES do
+    # widget ser criado na próxima rodada (ver logo abaixo de
+    # "pagina = st.sidebar.radio(...)").
+    st.session_state["_nav_pendente"] = "🧭 Fluxo de Análise (guiado)"
     st.rerun()
 
 def minhas_carteiras():
@@ -1731,15 +1773,22 @@ if pagina == "0. Screening de Ações":
             if escolhidas and st.button("💾 Guardar seleção para analisar uma a uma", type="primary"):
                 uid = usuario_id()
                 cadastradas = 0
+                incompletas = []
                 setores_existentes = sb_select("setores", "id,nome") or []
                 with st.spinner("Cadastrando empresas novas (buscando razão social, setor e CNPJ)..."):
-                    for tk in escolhidas:
+                    for idx_tk, tk in enumerate(escolhidas):
                         # verifica se empresa já existe no banco; se não, cria automaticamente
                         emps = sb_select("empresas", "id", filtros={"ticker": tk})
                         if emps:
                             eid = emps[0]["id"]
                         else:
+                            if idx_tk > 0:
+                                # intervalo entre pedidos pro Fundamentus não bloquear/limitar
+                                # quando várias ações são guardadas de uma vez
+                                time.sleep(1.2)
                             perfil = buscar_perfil_empresa_fundamentus(tk)
+                            if not perfil.get("razao_social") or not perfil.get("setor"):
+                                incompletas.append(tk)
                             nome_emp = perfil.get("razao_social") or tk
                             setor_id_auto = None
                             if perfil.get("setor"):
@@ -1762,17 +1811,28 @@ if pagina == "0. Screening de Ações":
                             eid = r_emp[0]["id"] if r_emp else None
                             cadastradas += 1
                         if eid:
-                            sb_upsert("lista_analise", {
-                                "empresa_id": eid, "usuario_id": uid,
+                            ja_na_lista = sb_select("lista_analise", "id",
+                                filtros={"empresa_id": eid, "usuario_id": uid})
+                            payload_lista = {
                                 "data_selecao": pd.Timestamp.now().isoformat(),
                                 "status": "pendente",
                                 "origem": json.dumps({"fonte": "Fundamentus", "filtros_ativos":
                                     [k for k,v in st.session_state["filtros_screen"].items() if v["ativo"]]})
-                            })
+                            }
+                            if ja_na_lista:
+                                sb_update("lista_analise", payload_lista, {"id": ja_na_lista[0]["id"]})
+                            else:
+                                payload_lista.update({"empresa_id": eid, "usuario_id": uid})
+                                sb_insert("lista_analise", payload_lista)
                 if cadastradas:
                     st.info(f"{cadastradas} empresa(s) nova(s) criada(s) automaticamente no banco "
                             "(razão social e setor via Fundamentus; CNPJ via BrAPI quando disponível — "
                             "confira e complete manualmente se algum campo não veio).")
+                if incompletas:
+                    st.warning("⚠️ O Fundamentus não trouxe razão social/setor completos pra: "
+                               + ", ".join(incompletas) + ". Use o botão '🔎 Buscar dados no Fundamentus' "
+                               "na tela '1. Empresas e Setores' pra tentar de novo (pode ter sido um "
+                               "bloqueio temporário por excesso de pedidos seguidos).")
                 st.success(f"✅ {len(escolhidas)} ação(ões) guardada(s) em 'Minha Lista de Análise'. "
                            "Vá para a Tela 0b para começar a análise.")
 
@@ -2208,6 +2268,39 @@ elif pagina == "1. Empresas e Setores":
             else:
                 st.warning("Não encontrou o CNPJ automaticamente (nem na CVM, nem via BrAPI). "
                            "Pode digitar manualmente no campo CNPJ abaixo.")
+
+    if empresa_id_edicao:
+        precisa_completar = (dados_atuais.get("razao_social", "") == dados_atuais.get("ticker", "")
+                              or not dados_atuais.get("setor_id"))
+        if precisa_completar:
+            fc1, fc2 = st.columns([1, 3])
+            if fc1.button("🔎 Buscar dados no Fundamentus"):
+                with st.spinner("Buscando razão social e setor..."):
+                    perfil_retroativo = buscar_perfil_empresa_fundamentus(dados_atuais.get("ticker", ""))
+                payload_retro = {}
+                if perfil_retroativo.get("razao_social"):
+                    payload_retro["razao_social"] = perfil_retroativo["razao_social"]
+                if perfil_retroativo.get("setor"):
+                    match_setor = next((s for s in setores if s["nome"].lower() == perfil_retroativo["setor"].lower()), None)
+                    if match_setor:
+                        payload_retro["setor_id"] = match_setor["id"]
+                    else:
+                        novo_setor = sb_insert("setores", {"nome": perfil_retroativo["setor"]})
+                        if novo_setor:
+                            payload_retro["setor_id"] = novo_setor[0]["id"]
+                if perfil_retroativo.get("subsetor"):
+                    payload_retro["segmento"] = perfil_retroativo["subsetor"]
+                if payload_retro:
+                    r_perfil = gravar_com_confirmacao(sb_update, "empresas", payload_retro, {"id": empresa_id_edicao},
+                        msg_ok="✅ Razão social/setor atualizados com sucesso.",
+                        msg_erro="❌ Encontrou dados mas não foi possível salvar.")
+                    if r_perfil:
+                        st.rerun()
+                else:
+                    st.warning("Não encontrou razão social/setor no Fundamentus pra esse ticker agora "
+                               "(pode ser bloqueio temporário — tente de novo em alguns minutos).")
+            fc2.caption("Aparece porque a razão social ainda está igual ao ticker, ou o setor está vazio "
+                        "— sinal de que o cadastro automático não veio completo.")
         cc2.caption("Busca primeiro no cadastro oficial da CVM (por nome aproximado), "
                     "com BrAPI como reserva.")
 
