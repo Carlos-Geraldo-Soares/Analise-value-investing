@@ -1,11 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v4.0
-GERADO EM: 2026-07-10 23:00 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Cadastro em lote no Screening ganhou intervalo entre
-buscas (evita bloqueio do Fundamentus); novo botão pra corrigir razão
-social/setor incompletos.
+VERSÃO DESTE ARQUIVO: v4.2
+GERADO EM: 2026-07-10 23:15 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Corrigido KeyError ao salvar Avaliação Qualitativa —
+código assumia coluna "id" que não existe nessa tabela.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -303,6 +302,30 @@ HISTÓRICO:
   Empresas (aparece quando razão social ainda está igual ao ticker ou o
   setor está vazio) pra corrigir retroativamente sem precisar apagar e
   recriar a empresa.
+- v4.1 (2026-07-10): A correção da v4.0 (intervalo entre buscas) não
+  resolveu — usuário testou o botão novo individualmente pra ALLD3 e
+  continuou falhando. Busquei a página real do Fundamentus pra ALLD3 e
+  confirmei que "Empresa: ALLIED ON NM" e "Setor: Comércio" ESTÃO lá.
+  Causa raiz de verdade: cada rótulo da tabela do Fundamentus vem com um
+  ícone de dica colado no texto (ex.: "?Empresa" em vez de "Empresa"), e
+  _normalizar_nome_coluna() só removia ponto/espaço/barra — o "?" sobrava
+  na chave normalizada ("?empresa"), nunca batendo com a busca por
+  "empresa". Corrigido pra remover QUALQUER caractere que não seja letra/
+  número (não só os 3 específicos de antes). Testado com HTML simulado
+  reproduzindo exatamente o padrão "?Rótulo" visto na página real —
+  confirmado que agora extrai "ALLIED ON NM"/"Comércio"/"Eletrodomésticos"
+  corretamente. Esse mesmo normalizador é usado também no Screening em
+  massa (_buscar_fundamentus_bruto), então essa correção deve melhorar a
+  extração de dados ali também.
+- v4.2 (2026-07-10): KeyError ao clicar "Salvar avaliação" na Etapa 3 — o
+  código tentava usar av[0]["id"] pra atualizar a linha existente, mas
+  a tabela avaliacao_qualitativa_buffett (uma das originais, nunca vi a
+  estrutura dela) não tem uma coluna chamada "id". Corrigido usando
+  {"empresa_id": emp_id} como referência da atualização em vez de tentar
+  adivinhar o nome da chave primária — mais seguro, já que essa consulta
+  sempre filtra (e assume unicidade) por empresa_id mesmo. Conferido que
+  esse era o único lugar do código com essa suposição pra essa tabela
+  específica.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -375,10 +398,16 @@ import requests
 
 
 def _normalizar_nome_coluna(c):
-    """snake_case sem acento, sem pontuação, sem underscore duplicado."""
+    """
+    snake_case sem acento, sem pontuação, sem underscore duplicado.
+    Remove QUALQUER caractere que não seja letra/número (não só ponto,
+    espaço e barra) — o Fundamentus coloca um ícone de dica junto de cada
+    rótulo (ex.: "?Empresa" em vez de "Empresa"), e isso sobrevivia na
+    normalização antiga, quebrando a busca de "empresa"/"setor" etc.
+    """
     c = str(c).strip().lower()
     c = "".join(x for x in unicodedata.normalize("NFKD", c) if not unicodedata.combining(x))
-    c = re.sub(r"[.\s/]+", "_", c)
+    c = re.sub(r"[^a-z0-9]+", "_", c)
     c = re.sub(r"_+", "_", c).strip("_")
     return c
 
@@ -2125,7 +2154,7 @@ elif pagina == "🧭 Fluxo de Análise (guiado)":
                             "fonte_analise": "Manual",
                         }
                         if av:
-                            gravar_com_confirmacao(sb_update, "avaliacao_qualitativa_buffett", payload_av, {"id": av[0]["id"]},
+                            gravar_com_confirmacao(sb_update, "avaliacao_qualitativa_buffett", payload_av, {"empresa_id": emp_id},
                                 msg_ok="✅ Avaliação atualizada com sucesso.", msg_erro="❌ Não foi possível atualizar a avaliação.")
                         else:
                             gravar_com_confirmacao(sb_insert, "avaliacao_qualitativa_buffett", payload_av,
