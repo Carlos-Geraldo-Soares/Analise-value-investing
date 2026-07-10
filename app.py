@@ -1,10 +1,10 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v3.7
-GERADO EM: 2026-07-10 22:33 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Filtros do Screening bloqueiam valores negativos em P/L,
-P/VP, Dív/PL, EV/EBITDA, P/EBITDA; exige pelo menos 1 filtro ativo.
+VERSÃO DESTE ARQUIVO: v3.8
+GERADO EM: 2026-07-10 22:49 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Corrigido "Minha Lista de Análise" sempre vazia pra contas
+comuns — usuario_id nem estava sendo buscado do banco.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -268,6 +268,14 @@ HISTÓRICO:
   exigência de pelo menos 1 filtro ativo (básico, avançado ou por
   atributo) antes de permitir a busca, evitando trazer as 994 ações de
   uma vez sem critério nenhum.
+- v3.8 (2026-07-10): Achado bug em "0b. Minha Lista de Análise": pra contas
+  comuns (não-admin), o código filtrava em Python por r.get("usuario_id"),
+  mas a coluna usuario_id nem estava na lista de campos buscados do banco
+  — então o filtro comparava None == uid, sempre False, e a lista aparecia
+  vazia mesmo com dados salvos corretamente (só não afetava a conta admin,
+  que pula esse filtro). Corrigido incluindo usuario_id na consulta e
+  passando o filtro direto pro sb_select (mesmo padrão já usado e correto
+  em minhas_carteiras()), em vez de filtrar depois em Python.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -1775,9 +1783,8 @@ elif pagina == "0b. Minha Lista de Análise":
     uid = usuario_id()
     filtro = {"usuario_id": uid} if not sou_admin() else None
     lista_raw = sb_select("lista_analise",
-                           "id,empresa_id,data_selecao,status,empresas(ticker,razao_social)", ordem="data_selecao")
-    if filtro:
-        lista_raw = [r for r in lista_raw if r.get("usuario_id") == uid]
+                           "id,empresa_id,usuario_id,data_selecao,status,empresas(ticker,razao_social)",
+                           filtros=filtro, ordem="data_selecao")
     if not lista_raw:
         st.info("Nenhuma ação guardada ainda. Vá para a Tela 0 (Screening), selecione ações e guarde.")
     else:
