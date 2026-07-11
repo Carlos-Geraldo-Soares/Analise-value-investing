@@ -1,10 +1,11 @@
 """
 app.py — Sistema de Value Investing (Etapa 5 — Supabase + Login)
 
-VERSÃO DESTE ARQUIVO: v4.2
-GERADO EM: 2026-07-10 23:15 UTC (horário real do relógio do sistema no momento da geração)
-ÚLTIMA MUDANÇA: Corrigido KeyError ao salvar Avaliação Qualitativa —
-código assumia coluna "id" que não existe nessa tabela.
+VERSÃO DESTE ARQUIVO: v4.3
+GERADO EM: 2026-07-10 23:35 UTC (horário real do relógio do sistema no momento da geração)
+ÚLTIMA MUDANÇA: Índice de Boa Empresa agora recusa calcular quando o
+balanço estiver desatualizado demais (>200 dias), em vez de gerar nota
+enganosa.
 
 HISTÓRICO:
 - v1.0 (2026-07-01): Correção do scraping do Fundamentus (bug 'Dív.Brut/Patrim.'),
@@ -326,6 +327,21 @@ HISTÓRICO:
   sempre filtra (e assume unicidade) por empresa_id mesmo. Conferido que
   esse era o único lugar do código com essa suposição pra essa tabela
   específica.
+- v4.3 (2026-07-10): Investigando a BSLI4 (BRB), percebido que o Índice de
+  Boa Empresa dava nota alta enganosa (Valuation 100, Qualidade Financeira
+  92,5) porque o cálculo usa o ÚLTIMO balanço salvo no sistema, e o BRB
+  está sem publicar balanço atualizado há meses por causa do escândalo do
+  Banco Master (confirmado por pesquisa: mais de 3 meses de atraso na
+  publicação, investigação da PF/STF em andamento). Também identificado
+  "Preço de mercado: R$ 300,00" incorreto pra BSLI4 (preço real é ~R$3-4),
+  causa ainda não confirmada com o usuário. Por sugestão do usuário,
+  criada verificar_balanco_desatualizado() — se o último balanço tiver
+  mais de 200 dias (~6,5 meses, acima do prazo legal de publicação
+  trimestral no Brasil com folga), o cálculo do Índice de Boa Empresa é
+  BLOQUEADO com aviso explícito, em vez de gerar uma nota que parece boa
+  mas usa dado morto. Testado com datas reais (mar/2026 passa, jun/2025
+  pra trás é bloqueado). Aplicado tanto no diagnóstico individual quanto
+  no "Recalcular todas" em lote.
 
 Rodar localmente: streamlit run app.py
 Na nuvem: publicado via Streamlit Community Cloud conectado ao GitHub
@@ -1308,6 +1324,23 @@ def calcular_indice_boa_empresa(emp, ind=None, preco=None, vi_medio=None,
     }
 
 
+def verificar_balanco_desatualizado(data_referencia_str, limite_dias=200):
+    """
+    Verifica se o último balanço de uma empresa está velho demais pra
+    confiar no Índice de Boa Empresa calculado em cima dele.
+    Limite padrão de 200 dias (~6,5 meses) — um pouco mais que o prazo
+    legal de publicação trimestral no Brasil (ITR ~45 dias após o
+    trimestre, DFP anual ~90 dias), com alguma folga pra atraso normal.
+    Retorna (esta_desatualizado: bool, dias: int ou None).
+    """
+    try:
+        data_ref = pd.to_datetime(data_referencia_str).date()
+        dias = (date.today() - data_ref).days
+        return dias > limite_dias, dias
+    except Exception:
+        return False, None
+
+
 def renderizar_diagnostico_boa_empresa(emp_id, emp, permitir_salvar=True):
     """
     Busca tudo que é preciso (balanço, indicadores, VI, avaliação qualitativa,
@@ -1323,6 +1356,16 @@ def renderizar_diagnostico_boa_empresa(emp_id, emp, permitir_salvar=True):
                    "Lance um balanço (Fluxo de Análise guiado, Etapa 1) para calcular o diagnóstico.")
         return None
     bal = bals[-1]
+
+    desatualizado, dias_balanco = verificar_balanco_desatualizado(bal.get("data_referencia"))
+    if desatualizado:
+        st.error(f"❌ Não é possível calcular o Índice de Boa Empresa com segurança: o último balanço "
+                 f"é de **{bal['data_referencia']}** ({dias_balanco} dias atrás), tempo maior que o prazo "
+                 "legal de publicação de um novo balanço. Um número calculado em cima de dados tão antigos "
+                 "pode enganar (parecer bom/ruim por motivos que já não valem mais). Busque um balanço "
+                 "mais recente antes de confiar nesse índice para esta empresa.")
+        return None
+
     ind = calc.calcular_indicadores(bal)
     preco = bal.get("preco_mercado_referencia")
     vis = sb_select("valor_intrinseco", "metodo,valor",
@@ -2623,6 +2666,12 @@ elif pagina == "4. Critérios e Índice de Qualidade":
                         erros.append(f"{row['ticker']}: sem balanço cadastrado, pulado")
                         continue
                     bal_c = bals_c[-1]
+                    desatualizado_c, dias_c = verificar_balanco_desatualizado(bal_c.get("data_referencia"))
+                    if desatualizado_c:
+                        erros.append(f"{row['ticker']}: balanço de {bal_c['data_referencia']} "
+                                     f"({dias_c} dias atrás) — desatualizado demais, pulado pra não gerar "
+                                     "nota enganosa")
+                        continue
                     ind_c = calc.calcular_indicadores(bal_c)
                     preco_c = bal_c.get("preco_mercado_referencia")
                     vis_c = sb_select("valor_intrinseco", "metodo,valor",
